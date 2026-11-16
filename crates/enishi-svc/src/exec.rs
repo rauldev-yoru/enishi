@@ -32,6 +32,9 @@ pub const DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// Carries a `--shell cmd` line to the inner cmd (see [`plan`]).
 const CMD_LINE_VAR: &str = "ENISHI_CMD_LINE";
 
+/// Prepended to every PowerShell command line so its output is UTF-8 (see `plan`).
+pub const PS_UTF8_PRELUDE: &str = "$__u=[System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=$__u; [Console]::InputEncoding=$__u; $OutputEncoding=$__u; Remove-Variable __u; ";
+
 pub const SHELLS: &[&str] = &["pwsh", "powershell", "cmd", "bash", "sh"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,12 +170,17 @@ pub fn plan(req: &ExecRequest, default: impl FnOnce() -> Shell) -> Result<Plan, 
         None => default(),
     };
     let line = req.command.join(" ");
+    // PowerShell writes to a redirected stdout using [Console]::OutputEncoding, which
+    // defaults to the OEM code page (accents and `€` arrive broken). Force UTF-8 without
+    // BOM for output and native-command pipes, then run the line. Piped stdin is already
+    // decoded (OEM) before this runs, so non-ASCII stdin to PowerShell stays a known gap.
+    let ps_line = format!("{PS_UTF8_PRELUDE}{line}");
     let ps = |program: &str| Plan {
         program: program.into(),
         args: ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command"]
             .map(String::from)
             .into_iter()
-            .chain([line.clone()])
+            .chain([ps_line.clone()])
             .collect(),
         raw_tail: None,
         env: Vec::new(),
@@ -611,7 +619,7 @@ mod tests {
                 "-NoLogo",
                 "-NonInteractive",
                 "-Command",
-                "Get-ChildItem C:\\"
+                &format!("{PS_UTF8_PRELUDE}Get-ChildItem C:\\")
             ]
         );
         let mut r = req(&["dir", "/b"]);
@@ -753,6 +761,24 @@ mod tests {
         );
         assert!(e.is_empty(), "{}", String::from_utf8_lossy(&e));
         assert_eq!(out.end, End::Exited(3));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_output_is_utf8() {
+        for shell in ["pwsh", "powershell"] {
+            if shell == "pwsh" && !on_path("pwsh.exe") {
+                continue;
+            }
+            // Output only: PowerShell decodes piped stdin with the OEM page before our
+            // prelude runs, so non-ASCII *stdin* is a known v0.1 limitation (design §3.3).
+            let mut r = req(&["Write-Output 'versíón ñ€'"]);
+            r.shell = Some(shell.into());
+            let (o, _e, out) = run_local(r, b"").await;
+            let text = String::from_utf8(o.clone()).map_err(|_| o).unwrap();
+            assert_eq!(text.trim(), "versíón ñ€", "{shell}");
+            assert_eq!(out.end, End::Exited(0), "{shell}");
+        }
     }
 
     #[tokio::test]

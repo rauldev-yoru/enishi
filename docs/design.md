@@ -120,6 +120,10 @@ As implemented (v0.1 step 3):
 - Presence decides offline: if the daemon has no live link the CLI gets `255` at once
   (≈3 ms measured) — nothing is dialed on the call path.
 
+- Windows text encoding: cmd and PowerShell output are forced to UTF-8 (cmd via an outer
+  `chcp 65001` + fresh cmd; PowerShell via a UTF-8 prelude). Known v0.1 gap: non-ASCII
+  **stdin** piped into PowerShell is decoded with the OEM code page.
+
 ### 3.4 Agent usage (MCP)
 
 ```yaml
