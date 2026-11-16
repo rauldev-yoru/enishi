@@ -104,6 +104,86 @@ fn on_path(exe: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
 }
 
+/// Default `PATHEXT` when the variable is missing.
+pub const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// Resolve a raw-mode program the way a Windows shell does: a bare name is looked up in
+/// each `PATH` directory, trying every `PATHEXT` extension unless the name already has one
+/// of them; a name with a directory part is only completed with the extensions. Returns
+/// `None` when nothing matches (the spawn then reports "not found").
+///
+/// Needed because Rust's `Command` only appends `.exe`, so the `.cmd` shims that `npx`,
+/// `pnpm`, `yarn`… install are not found by name. The current directory is deliberately
+/// not searched (cmd.exe does; that is how a planted `npx.cmd` in a cwd gets run).
+/// Pure (filesystem access through `is_file`) so it is unit-tested on every OS.
+pub fn resolve_windows_program(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&str>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let exts: Vec<String> = pathext
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(DEFAULT_PATHEXT)
+        .split(';')
+        .map(|e| e.trim().to_string())
+        .filter(|e| e.starts_with('.') && e.len() > 1)
+        .collect();
+    let has_ext = Path::new(program)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| exts.iter().any(|x| x[1..].eq_ignore_ascii_case(e)));
+    let candidates = |base: PathBuf| -> Vec<PathBuf> {
+        if has_ext {
+            return vec![base];
+        }
+        exts.iter()
+            .map(|e| {
+                let mut s = base.clone().into_os_string();
+                s.push(e);
+                PathBuf::from(s)
+            })
+            .collect()
+    };
+    if program.contains(['/', '\\', ':']) {
+        return candidates(PathBuf::from(program))
+            .into_iter()
+            .find(|c| is_file(c));
+    }
+    let path = path?;
+    std::env::split_paths(path)
+        .filter(|d| !d.as_os_str().is_empty())
+        .flat_map(|d| candidates(d.join(program)))
+        .find(|c| is_file(c))
+}
+
+/// The program to hand to `Command::new` for a raw plan: on Windows resolved through
+/// `PATH` (the request's own `PATH`, if it sets one) + `PATHEXT`, so `.cmd`/`.bat` shims
+/// work. A resolved batch file is then started by Rust's std, which (since 1.77, the
+/// BatBadBut fix CVE-2024-24576) runs it through `cmd.exe /e:ON /v:OFF /d /c` with every
+/// argument quoted and `%`/`"` escaped for cmd, and refuses arguments it cannot pass
+/// safely (`\r`, `\n`) with `InvalidInput` instead of letting cmd re-parse them.
+fn raw_program(program: &str, _env: &[(String, String)]) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        let path = _env
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+            .map(|(_, v)| std::ffi::OsString::from(v))
+            .or_else(|| std::env::var_os("PATH"));
+        let pathext = std::env::var("PATHEXT").ok();
+        if let Some(p) =
+            resolve_windows_program(program, path.as_deref(), pathext.as_deref(), |p| {
+                p.is_file()
+            })
+        {
+            return p.into_os_string();
+        }
+    }
+    program.into()
+}
+
 /// How to start a process: `program args… [raw_tail]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -289,7 +369,12 @@ pub struct Running {
 pub fn spawn(req: &ExecRequest) -> Result<Running, ExecError> {
     let t0 = Instant::now();
     let plan = plan(req, local_default_shell)?;
-    let mut cmd = Command::new(&plan.program);
+    let program = if req.raw {
+        raw_program(&plan.program, &req.env)
+    } else {
+        plan.program.clone().into()
+    };
+    let mut cmd = Command::new(&program);
     cmd.args(&plan.args);
     if let Some(tail) = &plan.raw_tail {
         #[cfg(windows)]
@@ -326,7 +411,8 @@ pub fn spawn(req: &ExecRequest) -> Result<Running, ExecError> {
         } else {
             exit::CANNOT_EXECUTE
         };
-        ExecError::new(code, format!("{}: {e}", plan.program))
+        let shown = program.to_string_lossy();
+        ExecError::new(code, format!("{shown}: {e}"))
     })?;
     let tree = tree::Tree::attach(&child);
     Ok(Running {
@@ -655,6 +741,50 @@ mod tests {
     }
 
     #[test]
+    fn windows_program_resolution() {
+        use std::ffi::OsString;
+        let files = [
+            "/c/node/npx.cmd",
+            "/c/node/node.exe",
+            "/c/tools/uvx.exe",
+            "/c/tools/npx.ps1",
+            "/c/py/script.bat",
+            "/c/rel/tool.CMD",
+        ];
+        // NTFS lookups are case-insensitive.
+        let is_file = |p: &Path| {
+            let p = p.to_string_lossy().replace('\\', "/").to_lowercase();
+            files.iter().any(|f| f.to_lowercase() == p)
+        };
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let path = OsString::from(["/c/tools", "", "/c/node", "/c/py"].join(sep));
+        let r = |p: &str, ext: Option<&str>| {
+            resolve_windows_program(p, Some(&path), ext, is_file)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        };
+        // npx → npx.cmd: the first PATH dir only has npx.ps1 (not in PATHEXT). Candidates
+        // carry PATHEXT's spelling (Windows matches file names case-insensitively).
+        assert_eq!(r("npx", None).as_deref(), Some("/c/node/npx.CMD"));
+        assert_eq!(r("node", None).as_deref(), Some("/c/node/node.EXE"));
+        assert_eq!(r("uvx", Some(".exe")).as_deref(), Some("/c/tools/uvx.exe"));
+        // A known extension is used as-is (matched case-insensitively against PATHEXT).
+        assert_eq!(r("script.BAT", None).as_deref(), Some("/c/py/script.BAT"));
+        assert_eq!(r("npx.ps1", None), None, ".ps1 is not in PATHEXT");
+        // PATHEXT contents and order are honoured; blank PATHEXT = default.
+        assert_eq!(r("npx", Some(".EXE;.COM")), None);
+        assert_eq!(r("npx", Some(" ")).as_deref(), Some("/c/node/npx.CMD"));
+        // Directory part: only the extensions are tried, never PATH.
+        assert_eq!(
+            r("/c/rel/tool", Some(".exe;.cmd")).as_deref(),
+            Some("/c/rel/tool.cmd")
+        );
+        assert_eq!(r("/c/node/npx", None).as_deref(), Some("/c/node/npx.CMD"));
+        assert_eq!(r("./npx", None), None, "cwd is never searched");
+        assert_eq!(r("missing", None), None);
+        assert_eq!(resolve_windows_program("npx", None, None, is_file), None);
+    }
+
+    #[test]
     fn home_expansion() {
         let h = Path::new("/home/u");
         assert_eq!(expand_home("~", Some(h)), PathBuf::from("/home/u"));
@@ -779,6 +909,115 @@ mod tests {
             assert_eq!(text.trim(), "versíón ñ€", "{shell}");
             assert_eq!(out.end, End::Exited(0), "{shell}");
         }
+    }
+
+    /// Raw spawn finds `.cmd` shims by name (`npx` → `npx.cmd`), like MCP docs expect.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn raw_npx_resolves_cmd_shim() {
+        let found = std::env::var_os("PATH").and_then(|p| {
+            resolve_windows_program(
+                "npx",
+                Some(&p),
+                std::env::var("PATHEXT").ok().as_deref(),
+                |f| f.is_file(),
+            )
+        });
+        let Some(found) = found else {
+            eprintln!("skipped: npx not on PATH");
+            return;
+        };
+        let mut r = req(&["npx", "--version"]);
+        r.raw = true;
+        let (o, e, out) = run_local(r, b"").await;
+        assert_eq!(
+            out.end,
+            End::Exited(0),
+            "{found:?} stderr {}",
+            String::from_utf8_lossy(&e)
+        );
+        let v = String::from_utf8_lossy(&o);
+        assert!(
+            v.trim().chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "{v:?}"
+        );
+    }
+
+    /// Arguments reach the program behind a `.cmd` intact: spaces, quotes, `&`, `%`, `^`
+    /// are not re-interpreted by cmd.exe (Rust std's BatBadBut escaping), and a newline
+    /// is refused at spawn instead of truncating the command line.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_shim_args_survive() {
+        let have_node = std::env::var_os("PATH").is_some_and(|p| {
+            resolve_windows_program("node", Some(&p), None, |f| f.is_file()).is_some()
+        });
+        if !have_node {
+            eprintln!("skipped: node not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("enishi-bat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("argv.js"),
+            "console.log(JSON.stringify(process.argv.slice(2)))",
+        )
+        .unwrap();
+        std::fs::write(dir.join("echoargs.cmd"), "@node \"%~dp0argv.js\" %*\r\n").unwrap();
+        let args = [
+            "a b",
+            "say \"hi\"",
+            "x&echo INJECTED",
+            "100%",
+            "^caret",
+            "|pipe>",
+            "",
+        ];
+        let mut words = vec!["echoargs".to_string()];
+        words.extend(args.iter().map(|s| s.to_string()));
+        let mut r = ExecRequest {
+            command: words,
+            raw: true,
+            env: vec![(
+                "PATH".into(),
+                format!("{};{}", dir.display(), std::env::var("PATH").unwrap()),
+            )],
+            ..Default::default()
+        };
+        let (o, e, out) = run_local(r.clone(), b"").await;
+        assert_eq!(out.end, End::Exited(0), "{}", String::from_utf8_lossy(&e));
+        let got: Vec<String> = serde_json_lite(&String::from_utf8_lossy(&o));
+        assert_eq!(got, args, "stdout {:?}", String::from_utf8_lossy(&o));
+        r.command.push("two\nlines".into());
+        assert_eq!(spawn(&r).err().map(|e| e.code), Some(exit::CANNOT_EXECUTE));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal parser for a JSON array of strings (keeps serde_json out of this crate).
+    #[cfg(windows)]
+    fn serde_json_lite(s: &str) -> Vec<String> {
+        let s = s
+            .trim()
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or("");
+        let mut out = Vec::new();
+        let mut cur = None::<String>;
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            match (&mut cur, c) {
+                (None, '"') => cur = Some(String::new()),
+                (Some(_), '"') => out.push(cur.take().unwrap()),
+                (Some(v), '\\') => match chars.next() {
+                    Some('n') => v.push('\n'),
+                    Some(o) => v.push(o),
+                    None => {}
+                },
+                (Some(v), c) => v.push(c),
+                (None, _) => {}
+            }
+        }
+        out
     }
 
     #[tokio::test]
