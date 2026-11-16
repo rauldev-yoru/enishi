@@ -20,6 +20,25 @@ pub struct Config {
     /// What each peer may do on this device.
     #[serde(default)]
     pub grants: BTreeMap<String, Grant>,
+    /// Local ports the daemon forwards to a peer's tcp service while it runs.
+    #[serde(default)]
+    pub forwards: BTreeMap<String, ForwardConfig>,
+}
+
+/// `[forwards.<name>]`: like a permanent `enishi forward`, started by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardConfig {
+    /// Peer publishing the service (default: `default_peer`).
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// The peer's `kind = "tcp"` service.
+    pub service: String,
+    /// Local port to listen on (required: the peer may be offline at startup).
+    pub local_port: u16,
+    /// Local address to listen on (default `127.0.0.1`).
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,15 +64,22 @@ pub struct PeerConfig {
 
 pub use enishi_proto::session::ServiceKind;
 
-/// A published stdio service (`[services.<name>]`). Spawned directly from `command` (argv,
-/// no shell) for every session; see [`crate::policy::authorize_service`] for who may open it.
+/// A published service (`[services.<name>]`). stdio/mcp: spawned directly from `command`
+/// (argv, no shell) for every session. tcp: each forwarded connection is connected to
+/// `target`. See [`crate::policy::authorize_service`] for who may open it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// argv (stdio and mcp services).
+    #[serde(default)]
     pub command: Vec<String>,
-    /// `mcp` or `stdio` (default). Informational: listed by `enishi services`.
+    /// `mcp`, `stdio` (default) or `tcp`. mcp/stdio are informational (listed by
+    /// `enishi services`); tcp services are only usable through `enishi forward`.
     #[serde(default)]
     pub kind: ServiceKind,
+    /// `host:port` this device connects to for each forwarded connection (tcp services).
+    #[serde(default)]
+    pub target: Option<String>,
     /// Peer names allowed to use this service (the peer also needs it in
     /// `[grants.<peer>] services`).
     #[serde(default)]
@@ -67,6 +93,26 @@ pub struct ServiceConfig {
     /// Extra environment for the process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+impl ServiceConfig {
+    /// Port of a tcp service's target.
+    pub fn target_port(&self) -> Option<u16> {
+        self.target.as_deref().and_then(parse_target_port)
+    }
+}
+
+/// The port of `host:port` / `[v6]:port` (host must be non-empty).
+pub fn parse_target_port(t: &str) -> Option<u16> {
+    let (host, port) = t.rsplit_once(':')?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() || (host.contains(':') && !t.starts_with('[')) {
+        return None;
+    }
+    port.parse().ok().filter(|p| *p != 0)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -129,13 +175,48 @@ impl Config {
         }
         for (name, svc) in &self.services {
             check_name("service", name)?;
-            if svc.command.is_empty() || svc.command[0].is_empty() {
-                bail!("service {name:?}: command must not be empty");
+            if svc.kind == ServiceKind::Tcp {
+                let Some(t) = &svc.target else {
+                    bail!("service {name:?}: kind = \"tcp\" needs target = \"host:port\"");
+                };
+                if parse_target_port(t).is_none() {
+                    bail!("service {name:?}: target {t:?} is not host:port");
+                }
+                if !svc.command.is_empty() || svc.allow_args {
+                    bail!("service {name:?}: a tcp service has no command/allow_args");
+                }
+            } else {
+                if svc.command.is_empty() || svc.command[0].is_empty() {
+                    bail!("service {name:?}: command must not be empty");
+                }
+                if svc.target.is_some() {
+                    bail!("service {name:?}: target is only for kind = \"tcp\"");
+                }
             }
             for p in &svc.allow {
                 if !self.peers.contains_key(p) {
                     bail!("service {name:?}: allow lists unknown peer {p:?}");
                 }
+            }
+        }
+        let mut binds = BTreeMap::new();
+        for (name, f) in &self.forwards {
+            check_name("forward", name)?;
+            let peer = f.peer.as_ref().or(self.device.default_peer.as_ref());
+            match peer {
+                Some(p) if self.peers.contains_key(p) => {}
+                Some(p) => bail!("[forwards.{name}] peer {p:?} is not a configured peer"),
+                None => bail!("[forwards.{name}] needs peer = \"…\" (no default_peer)"),
+            }
+            if f.local_port == 0 {
+                bail!("[forwards.{name}] local_port must not be 0");
+            }
+            let bind = f.bind.as_deref().unwrap_or("127.0.0.1");
+            if bind.parse::<std::net::IpAddr>().is_err() {
+                bail!("[forwards.{name}] bind {bind:?} is not an IP address");
+            }
+            if let Some(other) = binds.insert((bind.to_string(), f.local_port), name) {
+                bail!("[forwards.{other}] and [forwards.{name}] use the same local port");
             }
         }
         for (peer, grant) in &self.grants {
@@ -446,5 +527,64 @@ exec = {{ allow = ["git *"], deny = ["rm *"] }}
     fn load_reports_missing_file() {
         let e = Config::load(Path::new("/nonexistent/enishi.toml")).unwrap_err();
         assert!(format!("{e:#}").contains("no config at"));
+    }
+
+    #[test]
+    fn tcp_services_and_forwards() {
+        let base = format!(
+            "[device]\nname = \"pc\"\ndefault_peer = \"lap\"\n[peers.lap]\nid = \"{}\"\n",
+            id(1)
+        );
+        let ok = |extra: &str| format!("{base}{extra}").parse::<Config>();
+        let c = ok(
+            "[services.web]\nkind = \"tcp\"\ntarget = \"localhost:3000\"\nallow = [\"lap\"]\n\
+                    [forwards.db]\nservice = \"pg\"\nlocal_port = 5433\n",
+        )
+        .unwrap();
+        assert_eq!(c.services["web"].target_port(), Some(3000));
+        assert!(c.services["web"].command.is_empty());
+        assert_eq!(c.forwards["db"].peer, None);
+        assert_eq!(c.forwards["db"].local_port, 5433);
+        for (bad, why) in [
+            ("[services.web]\nkind = \"tcp\"\n", "needs target"),
+            (
+                "[services.web]\nkind = \"tcp\"\ntarget = \"3000\"\n",
+                "not host:port",
+            ),
+            (
+                "[services.web]\nkind = \"tcp\"\ntarget = \"h:3000\"\ncommand = [\"x\"]\n",
+                "no command",
+            ),
+            (
+                "[services.web]\ncommand = [\"x\"]\ntarget = \"h:1\"\n",
+                "only for kind",
+            ),
+            (
+                "[forwards.a]\npeer = \"zz\"\nservice = \"s\"\nlocal_port = 1\n",
+                "not a configured peer",
+            ),
+            (
+                "[forwards.a]\nservice = \"s\"\nlocal_port = 0\n",
+                "must not be 0",
+            ),
+            (
+                "[forwards.a]\nservice = \"s\"\nlocal_port = 1\nbind = \"localhost\"\n",
+                "not an IP",
+            ),
+            (
+                "[forwards.a]\nservice = \"s\"\nlocal_port = 1\n[forwards.b]\nservice = \"t\"\nlocal_port = 1\n",
+                "same local port",
+            ),
+            ("[forwards.a]\nservice = \"s\"\n", "local_port"),
+        ] {
+            let e = format!("{:#}", ok(bad).unwrap_err());
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+        assert_eq!(parse_target_port("[::1]:8080"), Some(8080));
+        assert_eq!(parse_target_port("10.0.0.1:22"), Some(22));
+        assert_eq!(parse_target_port("::1:80"), None);
+        assert_eq!(parse_target_port(":80"), None);
+        assert_eq!(parse_target_port("h:0"), None);
+        assert_eq!(parse_target_port("h:99999"), None);
     }
 }

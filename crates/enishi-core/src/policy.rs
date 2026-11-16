@@ -109,6 +109,7 @@ pub fn visible_services(cfg: &Config, peer: &str) -> Vec<ServiceInfo> {
             name: name.clone(),
             kind: s.kind,
             allow_args: s.allow_args,
+            port: s.target_port(),
         })
         .collect()
 }

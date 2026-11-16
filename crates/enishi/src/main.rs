@@ -87,6 +87,17 @@ enum Cmd {
     Mcp(mcp_cmd::McpArgs),
     /// List services the device publishes to us
     Services,
+    /// Forward a local TCP port to the device's tcp service until Ctrl-C:
+    /// `enishi -d pc forward web [8080]`
+    Forward {
+        /// The device's `kind = "tcp"` service
+        service: String,
+        /// Local port (default: the service's target port on the device)
+        local_port: Option<u16>,
+        /// Local address to listen on (0.0.0.0 shares it with your network)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
     /// Manage the services this device publishes (edits enishi.toml, then reloads)
     Service {
         #[command(subcommand)]
@@ -193,6 +204,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             std::process::exit(exec::run(&paths, req).await)
         }
         Cmd::Services => services(&paths, cli.device).await,
+        Cmd::Forward {
+            service,
+            local_port,
+            bind,
+        } => forward(&paths, cli.device, service, local_port, bind).await,
         Cmd::Mcp(args) => mcp_cmd::run(paths, cli.config, cli.device, args).await,
         Cmd::Service { action } => manage::service(&paths, action).await,
         Cmd::Grant(args) => manage::grant(&paths, args).await,
@@ -226,6 +242,11 @@ fn render_services(device: &str, services: &[ServiceInfo]) -> String {
         let usage = match s.kind {
             ServiceKind::Mcp => format!("enishi mcp {device}/{}", s.name),
             ServiceKind::Stdio => format!("enishi -d {device} run {}", s.name),
+            ServiceKind::Tcp => format!(
+                "enishi -d {device} forward {}{}",
+                s.name,
+                s.port.map(|p| format!("  (port {p})")).unwrap_or_default()
+            ),
         };
         out.push_str(&format!(
             "{:<w$}  {:<5}  {:<4}  {usage}\n",
@@ -235,6 +256,49 @@ fn render_services(device: &str, services: &[ServiceInfo]) -> String {
         ));
     }
     out
+}
+
+/// `enishi forward`: the daemon owns the listener while this connection stays open.
+async fn forward(
+    paths: &Paths,
+    device: Option<String>,
+    service: String,
+    port: Option<u16>,
+    bind: String,
+) -> Result<ExitCode> {
+    let req = IpcRequest::Forward {
+        device,
+        service,
+        bind: Some(bind),
+        port,
+    };
+    let mut stream = match ipc::connect(paths).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("enishi: {e}");
+            return Ok(code(exit::DAEMON_DOWN));
+        }
+    };
+    enishi_core::wire::write_frame(&mut stream, &req).await?;
+    loop {
+        match enishi_core::wire::read_frame::<_, IpcResponse>(&mut stream).await {
+            Ok(IpcResponse::Forwarding {
+                device,
+                service,
+                local,
+            }) => eprintln!("forwarding {local} -> {device}/{service} (Ctrl-C to stop)"),
+            Ok(IpcResponse::Note(m)) => eprintln!("{m}"),
+            Ok(IpcResponse::Error { code: c, message }) => {
+                eprintln!("enishi: {message}");
+                return Ok(code(c));
+            }
+            Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
+            Err(e) => {
+                eprintln!("enishi: daemon connection lost: {e:#}");
+                return Ok(code(exit::DAEMON_DOWN));
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_env(s: &str) -> Result<(String, String), String> {
@@ -579,11 +643,13 @@ mod tests {
                     name: "fs".into(),
                     kind: ServiceKind::Mcp,
                     allow_args: false,
+                    port: None,
                 },
                 ServiceInfo {
                     name: "wc".into(),
                     kind: ServiceKind::Stdio,
                     allow_args: true,
+                    port: None,
                 },
             ],
         );

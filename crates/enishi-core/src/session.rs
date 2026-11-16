@@ -29,8 +29,11 @@ use tracing::{debug, info, warn};
 
 use crate::{
     audit::{Direction, Entry},
+    config::ServiceKind,
     daemon::{Peer, Shared},
-    policy::{authorize_exec, authorize_mcp, authorize_service, mcp_command, service_command},
+    policy::{
+        Refusal, authorize_exec, authorize_mcp, authorize_service, mcp_command, service_command,
+    },
     wire,
 };
 
@@ -59,6 +62,7 @@ fn describe(h: &SessionKind) -> (&'static str, String) {
         SessionKind::Service { name, args } if args.is_empty() => ("service", name.clone()),
         SessionKind::Service { name, args } => ("service", format!("{name} {}", show(args))),
         SessionKind::Mcp(r) => ("mcp", show(&r.command)),
+        SessionKind::Tcp { service } => ("tcp", service.clone()),
     }
 }
 
@@ -67,6 +71,7 @@ fn entry<'a>(dir: Direction, peer: &'a str, h: &'a SessionKind) -> Entry<'a> {
         SessionKind::Exec(r) => Entry::exec(dir, peer, r),
         SessionKind::Service { name, args } => Entry::service(dir, peer, name, args),
         SessionKind::Mcp(r) => Entry::mcp(dir, peer, r),
+        SessionKind::Tcp { service } => Entry::service(dir, peer, service, &[]),
     }
 }
 
@@ -279,12 +284,25 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     let (word, what) = describe(&header);
     // Services: authorize, then the service's argv (no shell) is the process to spawn.
     let (req, service, mcp) = match header {
+        SessionKind::Tcp { service } => {
+            return crate::forward::serve(sh, peer, send, recv, service).await;
+        }
         SessionKind::Exec(r) => (r, None, false),
         SessionKind::Mcp(r) => (mcp_command(r), None, true),
         SessionKind::Service { name, args } => {
             let planned = {
                 let cfg = sh.cfg();
-                authorize_service(&cfg, &peer.name, &name, &args).map(|s| service_command(s, &args))
+                authorize_service(&cfg, &peer.name, &name, &args).and_then(|s| {
+                    if s.kind == ServiceKind::Tcp {
+                        return Err(Refusal {
+                            code: exit::USAGE,
+                            message: format!(
+                                "service {name:?} is a tcp service (use `enishi forward {name}`)"
+                            ),
+                        });
+                    }
+                    Ok(service_command(s, &args))
+                })
             };
             match planned {
                 Ok(req) => (req, Some(name), false),
@@ -406,7 +424,7 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     audit(exit_code, error);
 }
 
-async fn refuse(send: &mut SendStream, code: i32, message: String) -> Result<()> {
+pub(crate) async fn refuse(send: &mut SendStream, code: i32, message: String) -> Result<()> {
     wire::write_frame(send, &SessionAck::Err { code, message }).await?;
     send.finish()?;
     Ok(())

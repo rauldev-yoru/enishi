@@ -14,7 +14,7 @@
 //! `enishi reload` add, replace and retire peers without a restart.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     sync::{
         Arc, Mutex, RwLock,
@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     audit::{AUDIT_FILE, Audit},
+    config::ForwardConfig,
     config::{Config, Grant, PeerConfig},
     ipc,
     pair::{InviteBook, hint_addrs},
@@ -212,6 +213,8 @@ pub(crate) struct Shared {
     /// Serializes edits of the config file and of the peer set (pairing, reload).
     pub(crate) cfg_edit: tokio::sync::Mutex<()>,
     pub(crate) audit: Audit,
+    /// Running `[forwards.*]` listeners, by name, with the config they were started from.
+    forwards: Mutex<HashMap<String, (ForwardConfig, tokio::task::AbortHandle)>>,
 }
 
 impl Shared {
@@ -310,12 +313,47 @@ impl Shared {
         if new.device.listen_port != self.listen_port {
             report.needs_restart.push("[device] listen_port".into());
         }
+        let forwards = new.forwards.clone();
+        let default_peer = new.device.default_peer.clone();
         *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = new;
+        self.sync_forwards(forwards, default_peer);
         for p in started {
             info!(peer = %p.name, "peer added");
             tokio::spawn(supervise(self.ep.clone(), self.clone(), p));
         }
         report
+    }
+
+    /// Start/stop `[forwards.*]` listeners to match the config (unchanged ones keep running).
+    fn sync_forwards(
+        self: &Arc<Self>,
+        want: BTreeMap<String, ForwardConfig>,
+        default_peer: Option<String>,
+    ) {
+        let mut running = self.forwards.lock().unwrap_or_else(|e| e.into_inner());
+        running.retain(|name, (cfg, task)| {
+            let keep = want.get(name) == Some(cfg);
+            if !keep {
+                info!("forward {name}: stopped (config changed)");
+                task.abort();
+            }
+            keep
+        });
+        for (name, f) in want {
+            if running.contains_key(&name) {
+                continue;
+            }
+            let Some(device) = f.peer.clone().or_else(|| default_peer.clone()) else {
+                continue; // rejected by Config::validate
+            };
+            let task = tokio::spawn(crate::forward::run_configured(
+                self.clone(),
+                name.clone(),
+                device,
+                f.clone(),
+            ));
+            running.insert(name, (f, task.abort_handle()));
+        }
     }
 
     /// Checks that only make sense for the running daemon.
@@ -347,7 +385,7 @@ impl Shared {
     }
 
     /// `enishi services`: ask the peer which services it publishes to us.
-    async fn list_services(&self, device: Option<String>) -> IpcResponse {
+    pub(crate) async fn list_services(&self, device: Option<String>) -> IpcResponse {
         let peer = match self.target(device.as_deref()) {
             Ok(p) => p,
             Err(message) => {
@@ -435,6 +473,7 @@ impl Shared {
             IpcRequest::Exec { .. }
             | IpcRequest::Run { .. }
             | IpcRequest::Open { .. }
+            | IpcRequest::Forward { .. }
             | IpcRequest::Services { .. }
             | IpcRequest::PairJoin { .. }
             | IpcRequest::Reload => IpcResponse::Error {
@@ -578,6 +617,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         }),
         gate,
         cfg_edit: tokio::sync::Mutex::new(()),
+        forwards: Mutex::new(HashMap::new()),
     });
     let n_peers = cfg.peers.len();
     // Starts a supervisor per peer and fills the allow-list.
@@ -651,6 +691,12 @@ where
             session::client(sh, stream, device, header).await
         }
         IpcRequest::Open { device, header } => session::client(sh, stream, device, header).await,
+        IpcRequest::Forward {
+            device,
+            service,
+            bind,
+            port,
+        } => crate::forward::serve_cli(sh, stream, device, service, bind, port).await,
         IpcRequest::Services { device } => {
             let resp = sh.list_services(device).await;
             wire::write_frame(&mut stream, &resp).await

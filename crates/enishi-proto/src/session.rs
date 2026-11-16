@@ -31,6 +31,9 @@ pub enum ServiceKind {
     /// Any other stdio program; consume it with `enishi run` (the default).
     #[default]
     Stdio,
+    /// A TCP port on (or reachable from) the device (`target = "host:port"`); consume it
+    /// with `enishi forward`.
+    Tcp,
 }
 
 impl ServiceKind {
@@ -38,6 +41,7 @@ impl ServiceKind {
         match self {
             ServiceKind::Mcp => "mcp",
             ServiceKind::Stdio => "stdio",
+            ServiceKind::Tcp => "tcp",
         }
     }
 }
@@ -49,6 +53,8 @@ pub struct ServiceInfo {
     pub kind: ServiceKind,
     /// Extra args after `--` are forwarded to the command.
     pub allow_args: bool,
+    /// Tcp services: the target's port (`enishi forward`'s default local port).
+    pub port: Option<u16>,
 }
 
 /// First frame of every session stream.
@@ -66,6 +72,11 @@ pub enum SessionKind {
     /// mode"). The peer authorizes it with its `[grants.<peer>] mcp` policy; it never parses
     /// the MCP traffic, which is plain stdio like any service.
     Mcp(ExecRequest),
+    /// Tunnel one TCP connection to the published `kind = "tcp"` service: after the ack
+    /// the stream carries raw bytes both ways; finishing a direction is a TCP half-close.
+    Tcp {
+        service: String,
+    },
 }
 
 /// The peer's answer to a [`SessionKind`] header.
@@ -141,6 +152,9 @@ mod tests {
             name: "fs".into(),
             args: vec![],
         });
+        rt(SessionKind::Tcp {
+            service: "web".into(),
+        });
         rt(SessionKind::Mcp(ExecRequest {
             command: vec!["npx".into(), "-y".into(), "pkg".into()],
             raw: true,
@@ -150,11 +164,13 @@ mod tests {
             name: "fs".into(),
             kind: ServiceKind::Mcp,
             allow_args: true,
+            port: None,
         });
         rt(crate::ctl::CtlResponse::Services(vec![ServiceInfo {
             name: "wc".into(),
             kind: ServiceKind::Stdio,
             allow_args: false,
+            port: Some(3000),
         }]));
         rt(crate::ctl::CtlRequest::Services);
         rt(SessionAck::Ok);

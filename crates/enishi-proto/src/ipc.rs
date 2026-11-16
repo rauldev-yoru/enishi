@@ -37,6 +37,15 @@ pub enum IpcRequest {
         device: Option<String>,
         header: SessionKind,
     },
+    /// `enishi forward`: listen on `bind:port` (default 127.0.0.1 and the service's target
+    /// port) and tunnel each connection to the tcp service; lasts while this IPC
+    /// connection stays open. Replies `Forwarding`, then `Note`s.
+    Forward {
+        device: Option<String>,
+        service: String,
+        bind: Option<String>,
+        port: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,6 +71,14 @@ pub enum IpcResponse {
         device: String,
         services: Vec<ServiceInfo>,
     },
+    /// The forward is listening on `local`.
+    Forwarding {
+        device: String,
+        service: String,
+        local: String,
+    },
+    /// A log line for the CLI (e.g. a forwarded connection refused while the peer is down).
+    Note(String),
 }
 
 /// A pairing that completed on this device.

@@ -25,11 +25,15 @@ pub enum ServiceCmd {
     Add {
         name: String,
         /// The command is an MCP server (`enishi mcp <device>/<name>` on the consumer)
-        #[arg(long, conflicts_with = "stdio")]
+        #[arg(long, conflicts_with_all = ["stdio", "tcp"])]
         mcp: bool,
         /// Plain stdio service (`enishi run <name>`); the default
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tcp")]
         stdio: bool,
+        /// TCP service: forward connections to HOST:PORT (`enishi forward <name>` on the
+        /// consumer); takes no command
+        #[arg(long, value_name = "HOST:PORT", conflicts_with_all = ["allow_args", "cwd", "env"])]
+        tcp: Option<String>,
         /// Peer allowed to use it (repeatable). It also needs the service granted.
         #[arg(long = "allow", value_name = "PEER")]
         allow: Vec<String>,
@@ -45,7 +49,7 @@ pub enum ServiceCmd {
         /// Replace an existing service with the same name
         #[arg(long)]
         force: bool,
-        #[arg(last = true, required = true, value_name = "COMMAND")]
+        #[arg(last = true, required_unless_present = "tcp", value_name = "COMMAND")]
         command: Vec<String>,
     },
     /// List the services this device publishes (from the local config)
@@ -156,6 +160,7 @@ pub async fn service(paths: &Paths, cmd: ServiceCmd) -> Result<ExitCode> {
             name,
             mcp,
             stdio: _,
+            tcp,
             allow,
             allow_args,
             cwd,
@@ -163,16 +168,23 @@ pub async fn service(paths: &Paths, cmd: ServiceCmd) -> Result<ExitCode> {
             force,
             command,
         } => {
+            if tcp.is_some() && !command.is_empty() {
+                anyhow::bail!("a --tcp service takes no command");
+            }
             let text = read_config(paths)?;
             let spec = ServiceSpec {
                 name: name.clone(),
-                kind: kind_of(mcp),
+                kind: if tcp.is_some() {
+                    ServiceKind::Tcp
+                } else {
+                    kind_of(mcp)
+                },
                 command,
+                target: tcp,
                 allow: allow.clone(),
                 allow_args,
                 cwd,
                 env: env.into_iter().collect(),
-                ..Default::default()
             };
             let out = config_edit::add_service(&text, &spec, force)?;
             println!(
@@ -394,7 +406,7 @@ fn render_local_services(cfg: &Config) -> String {
         .unwrap_or(0)
         .max(7);
     let mut out = format!(
-        "{:<w$}  {:<5}  {:<4}  {:<20}  COMMAND\n",
+        "{:<w$}  {:<5}  {:<4}  {:<20}  COMMAND/TARGET\n",
         "SERVICE", "KIND", "ARGS", "ALLOW"
     );
     for (name, s) in &cfg.services {
@@ -418,7 +430,10 @@ fn render_local_services(cfg: &Config) -> String {
             "{name:<w$}  {:<5}  {:<4}  {allow:<20}  {}\n",
             s.kind.as_str(),
             if s.allow_args { "yes" } else { "no" },
-            shown_command(&s.command),
+            match &s.target {
+                Some(t) => format!("-> {t}"),
+                None => shown_command(&s.command),
+            },
         ));
     }
     out
@@ -448,7 +463,8 @@ mod tests {
         let cfg: Config = format!(
             "[device]\nname = \"x\"\n[peers.a]\nid = \"{}\"\n[peers.b]\nid = \"{}\"\n\
              [services.fs]\nkind = \"mcp\"\ncommand = [\"npx\", \"-y\", \"a b\"]\nallow = [\"a\", \"b\"]\n\
-             [grants.a]\nservices = [\"fs\"]\n",
+             [services.web]\nkind = \"tcp\"\ntarget = \"localhost:3000\"\nallow = [\"a\"]\n\
+             [grants.a]\nservices = [\"fs\", \"web\"]\n",
             id(1),
             id(2)
         )
@@ -457,10 +473,11 @@ mod tests {
         let t = render_local_services(&cfg);
         assert_eq!(
             t,
-            "SERVICE  KIND   ARGS  ALLOW                 COMMAND\n\
-             fs       mcp    no    a,b(no grant)         npx -y \"a b\"\n"
+            "SERVICE  KIND   ARGS  ALLOW                 COMMAND/TARGET\n\
+             fs       mcp    no    a,b(no grant)         npx -y \"a b\"\n\
+             web      tcp    no    a                     -> localhost:3000\n"
         );
-        assert!(render_grant(&cfg, "a").contains("services: fs"));
+        assert!(render_grant(&cfg, "a").contains("services: fs, web"));
         assert!(render_grant(&cfg, "b").contains("services: none"));
     }
 
