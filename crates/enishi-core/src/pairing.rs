@@ -68,7 +68,7 @@ impl Shared {
         self.gate
             .invites()
             .create(secret, name.clone(), ttl, Instant::now(), SystemTime::now());
-        let addrs = self.current_addrs();
+        let addrs = self.invite_addrs();
         if addrs.is_empty() {
             warn!("pairing invite has no direct address hints; the joiner relies on discovery");
         }

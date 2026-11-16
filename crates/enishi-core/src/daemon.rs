@@ -45,7 +45,7 @@ use crate::{
     config::ForwardConfig,
     config::{Config, Grant, PeerConfig},
     ipc,
-    pair::{InviteBook, hint_addrs},
+    pair::{InviteBook, own_hint_addrs},
     pairing,
     paths::Paths,
     policy::{service_details, visible_services},
@@ -250,24 +250,24 @@ impl Shared {
     }
 
     /// Address hints worth storing on the other side: only with a fixed `listen_port`
-    /// (an ephemeral port changes on every restart), and only our own interface
-    /// addresses on that port (not NAT-mapped ones observed by relays).
+    /// (an ephemeral port changes on every restart), and only our own addresses on that
+    /// port ([`own_hint_addrs`]: no NAT mappings observed by relays).
     pub(crate) fn stable_addrs(&self) -> Vec<SocketAddr> {
         match self.listen_port {
-            Some(port) => hint_addrs(
-                self.ep
-                    .addr()
-                    .ip_addrs()
-                    .copied()
-                    .filter(|a| a.port() == port),
-            ),
+            Some(port) => own_hint_addrs(self.ep.addr().ip_addrs().copied(), &[port]),
             None => Vec::new(),
         }
     }
 
-    /// Our direct addresses right now, best first.
-    pub(crate) fn current_addrs(&self) -> Vec<SocketAddr> {
-        hint_addrs(self.ep.addr().ip_addrs().copied())
+    /// Hints for a pairing invite: our own addresses on the fixed `listen_port`, else on
+    /// the sockets bound right now (an invite lives in this daemon's memory, so those
+    /// ports stay valid for as long as the invite does).
+    pub(crate) fn invite_addrs(&self) -> Vec<SocketAddr> {
+        let ports: Vec<u16> = match self.listen_port {
+            Some(port) => vec![port],
+            None => self.ep.bound_sockets().iter().map(|a| a.port()).collect(),
+        };
+        own_hint_addrs(self.ep.addr().ip_addrs().copied(), &ports)
     }
 
     /// Make `new` the running config: retire peers that left or changed, start the new

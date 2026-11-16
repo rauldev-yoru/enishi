@@ -440,9 +440,13 @@ paired with "server" as peer "server" (a1b2c3d4e5); exec and services stay denie
 - **Code**: `enishi1-` + lowercase RFC 4648 base32 (no padding) of postcard
   `InviteCode {id: [u8; 32], secret: [u8; 16], device, addrs: Vec<SocketAddr>}` followed
   by a 4-byte FNV-1a checksum (catches truncated / mistyped pastes; integrity is not
-  security — the secret and TLS are). `addrs` are A's current direct addresses as dial
-  hints, best first: Tailscale/CGNAT v4, 192.168/16, 10/8, other v4, Tailscale v6,
-  other v6; loopback/link-local/unspecified/multicast dropped, container bridges
+  security — the secret and TLS are). `addrs` are dial hints with A's **own** addresses
+  only: those on its fixed `listen_port` (without one: on the sockets the daemon is bound
+  to now, valid as long as the in-memory invite) in directly reachable ranges —
+  Tailscale/CGNAT 100.64/10, private IPv4, IPv6 ULA (fc00::/7) and global (2000::/3).
+  Public IPv4 addresses and other ports are dropped: those are NAT mappings iroh observed
+  through relays, useless as static hints (discovery/relay cover that path). Best first:
+  Tailscale/CGNAT v4, 192.168/16, 10/8, Tailscale v6, other v6; container bridges
   (172.16/12) only when nothing better exists, max 8. Decoding is case-insensitive and
   ignores whitespace. Typically ~150–250 characters.
 - **Handshake** (`enishi/pair/1`): B's daemon dials A with the code's id + addrs (iroh
@@ -462,7 +466,8 @@ paired with "server" as peer "server" (a1b2c3d4e5); exec and services stay denie
   `[A-Za-z0-9._-]` (anything else → `-`), unless `--name` is given (invite → A's name for B,
   join → B's name for A). A collision is an error naming `--name` as the way out.
 - **Stored**: each side appends `[peers.<name>] id = …` (+ `addrs` = the other side's
-  stable hints, only when it has a fixed `listen_port`, and only addresses on that port)
+  stable hints, only when it has a fixed `listen_port`: the same own-address filter as
+  invites, on that port)
   to **its own** `enishi.toml` with `toml_edit`, so comments and layout are kept; if
   `[device] default_peer` is unset it is set to the new peer. Grants are not written:
   the new peer can do nothing until `[grants.<name>]` is added (the CLI prints how).

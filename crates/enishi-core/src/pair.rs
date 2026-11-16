@@ -272,8 +272,43 @@ pub fn clean_device(device: &str) -> String {
 /// and multicast addresses are dropped, 172.16/12 too when anything better exists; at
 /// most [`MAX_ADDRS`] are kept.
 pub fn hint_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    hint_addrs_by(addrs, |_| true)
+}
+
+/// The hints a device gives about itself (invites, pair requests/answers): only its own
+/// interface addresses on one of `ports` (its fixed `listen_port`, or the sockets it is
+/// bound to right now) in the ranges a peer can reach directly — Tailscale/CGNAT
+/// 100.64/10, private IPv4 (10/8, 172.16/12, 192.168/16), IPv6 ULA (fc00::/7, Tailscale
+/// included) and global unicast (2000::/3). Public IPv4 addresses are dropped: what iroh
+/// reports there is a NAT mapping observed by relays (its own port, gone with the
+/// mapping), useless as a static hint; other ports are other sockets or mappings too.
+pub fn own_hint_addrs(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    ports: &[u16],
+) -> Vec<SocketAddr> {
+    hint_addrs_by(addrs, |a| ports.contains(&a.port()) && own_scope(a.ip()))
+}
+
+fn own_scope(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private() || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            let s0 = v6.segments()[0];
+            (s0 & 0xfe00) == 0xfc00 || (s0 & 0xe000) == 0x2000
+        }
+    }
+}
+
+fn hint_addrs_by(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    keep: impl Fn(&SocketAddr) -> bool,
+) -> Vec<SocketAddr> {
     let mut v: Vec<(u8, SocketAddr)> = addrs
         .into_iter()
+        .filter(|a| keep(a))
         .filter_map(|a| rank(a.ip()).map(|r| (r, a)))
         .collect();
     v.sort();
@@ -465,5 +500,54 @@ mod tests {
         // Container bridges only when there is nothing better.
         let only: Vec<SocketAddr> = vec!["172.17.0.1:1".parse().unwrap()];
         assert_eq!(hint_addrs(only.clone()), only);
+    }
+
+    #[test]
+    fn own_hints_only_fixed_port_and_reachable_ranges() {
+        // What iroh reported for a daemon with listen_port = 7811 behind a home NAT.
+        let seen = [
+            "100.83.136.2:7811",
+            "192.168.1.42:7811",
+            "190.237.34.66:53684", // public NAT mapping
+            "190.237.34.66:7811",  // public, even on our port
+            "[2001:1388:4a01:7997:3266:481e:8ed8:f6cf]:40660", // v6 socket, random port
+            "[2001:1388:4a01:7997::5]:7811",
+            "[fd7a:115c:a1e0::5]:7811",
+            "[fd00:1::2]:7811",
+            "10.0.0.2:7811",
+            "172.17.0.1:7811", // bridge: dropped since better ones exist
+            "10.0.0.9:9999",
+            "127.0.0.1:7811",
+            "[fe80::1]:7811",
+            "8.8.8.8:7811",
+        ]
+        .map(|s| s.parse::<SocketAddr>().unwrap());
+        let got: Vec<String> = own_hint_addrs(seen, &[7811])
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "100.83.136.2:7811",
+                "192.168.1.42:7811",
+                "10.0.0.2:7811",
+                "[fd7a:115c:a1e0::5]:7811",
+                "[2001:1388:4a01:7997::5]:7811",
+                "[fd00:1::2]:7811",
+            ]
+        );
+        // Several bound sockets (no fixed port): each one's own addresses.
+        let got = own_hint_addrs(seen, &[9999, 40660]);
+        assert_eq!(
+            got,
+            [
+                "10.0.0.9:9999".parse::<SocketAddr>().unwrap(),
+                "[2001:1388:4a01:7997:3266:481e:8ed8:f6cf]:40660"
+                    .parse()
+                    .unwrap(),
+            ]
+        );
+        assert!(own_hint_addrs(seen, &[]).is_empty());
     }
 }
