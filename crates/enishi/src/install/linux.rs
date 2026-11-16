@@ -39,6 +39,11 @@ fn systemctl(args: &[&str]) -> Result<String> {
     run_cmd(Command::new("systemctl").arg("--user").args(args))
 }
 
+/// What `install` did to the unit: an upgrade over a running daemon restarts it.
+fn started_word(was_active: bool) -> &'static str {
+    if was_active { "restarted" } else { "started" }
+}
+
 fn is_ours(unit: &Path) -> bool {
     std::fs::read_to_string(unit).is_ok_and(|t| t.contains(MARKER))
 }
@@ -110,8 +115,9 @@ pub fn install(ctx: &Ctx, args: &InstallArgs, previous: Option<&Manifest>) -> Re
         );
     } else {
         // restart, not `enable --now`: an upgrade must pick up the new binary.
+        let was_active = systemctl(&["is-active", &unit_name]).is_ok();
         systemctl(&["restart", &unit_name])?;
-        println!("started {unit_name}");
+        println!("{} {unit_name}", started_word(was_active));
     }
     Ok(Manifest {
         name: args.name.clone(),
@@ -354,4 +360,15 @@ pub fn uninstall(name: &str, m: Option<&Manifest>, _no_firewall: bool) -> Result
         None => println!("binary left in place (no install record says where it came from)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_says_restarted() {
+        assert_eq!(started_word(true), "restarted");
+        assert_eq!(started_word(false), "started");
+    }
 }
