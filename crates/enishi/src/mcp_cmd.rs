@@ -182,10 +182,22 @@ pub async fn run(
         return Ok(code(exit::USAGE));
     }
     if let Some((agent, name)) = config {
-        let command = std::env::current_exe()
-            .and_then(|p| p.canonicalize())
-            .map(|p| strip_verbatim(p.display().to_string()))
-            .unwrap_or_else(|_| "enishi".into());
+        // Prefer the bare `enishi` when that is what PATH resolves to: readable configs and
+        // they survive upgrades/reinstalls. Fall back to the absolute path otherwise.
+        let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+        let on_path = exe.as_ref().is_some_and(|exe| {
+            std::env::var_os("PATH").is_some_and(|path| {
+                std::env::split_paths(&path).any(|dir| {
+                    ["enishi", "enishi.exe"]
+                        .iter()
+                        .any(|n| dir.join(n).canonicalize().is_ok_and(|c| &c == exe))
+                })
+            })
+        });
+        let command = match exe {
+            Some(p) if !on_path => strip_verbatim(p.display().to_string()),
+            _ => "enishi".into(),
+        };
         let mut env = Vec::new();
         if config_override.is_some() {
             // Agents start the shim with their own environment: pin the config used here.
