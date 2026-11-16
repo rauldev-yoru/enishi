@@ -11,7 +11,8 @@ today; macOS and phone later). Once two devices are paired you can, from either 
   milliseconds instead of hanging, and everything reconnects on its own when it wakes up.
 
 It was built for AI agents that live on a server but need to act on your PC (your real browser,
-your apps, your corporate VPN), and it is just as useful from a plain terminal.
+your apps, local services, networks only that machine can reach such as custom VPNs), and it is
+just as useful from a plain terminal.
 
 Status: **v0.1.1** — link, presence, pairing, `exec`, services, MCP and TCP forwarding work
 and are tested Linux ↔ Windows (x86_64), and `enishi install` sets it up as a per-user
