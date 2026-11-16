@@ -62,7 +62,10 @@ clashes with real flags, working shell completion). Decided in D1.
 
 | Command | What it does |
 |---|---|
-| `enishi up` | Run the daemon (foreground; installers wrap it as a service / logon task). |
+| `enishi up [--log-file [PATH]]` | Run the daemon (foreground). `--log-file` also writes a size-rotated log (default `enishi.log` in the config dir); the installed unit / task runs `up --log-file`. |
+| `enishi install [--prefix DIR] [--name N] [--no-start] [--firewall]` / `enishi uninstall [--name N] [--purge --yes]` | Per-user install: binary, autostart (systemd user unit / logon task), start; reverse it (§7). |
+| `enishi logs [-n N] [-f]` | Print / follow the daemon log file. |
+| `enishi firewall [--name N] [--remove]` | Windows: Private-only inbound rule for enishi (needs admin; prints the elevated command otherwise). |
 | `enishi id` | Print this device's public id. |
 | `enishi pair invite` / `enishi pair join <code>` | One-time pairing (see §6). |
 | `enishi reload` | Re-read `enishi.toml` into the running daemon (peers, grants, services). |
@@ -463,21 +466,82 @@ path, so it also picks up pending manual edits.
 
 ## 7. Platform specifics
 
+**Installing (v0.1 step 6).** No installer packages: the binary installs itself, per user,
+with no admin rights (only the optional Windows firewall rule needs elevation).
+`enishi install` copies the *running* binary to the install dir, registers autostart,
+starts it and waits until the daemon answers over IPC. Re-running it (from a newer
+binary) is the upgrade path; it is idempotent. Each install writes a small record
+(`<data dir>/enishi/installs/<name>.json`: binary paths, pinned config, PATH change) so
+`enishi uninstall` reverses exactly what was done. `--name` (default `enishi`) names the
+unit/task, so a test instance can live next to the real one. If no config exists, install
+writes a minimal `[device] name = <hostname>`. When the config is non-default
+(`--config` / `ENISHI_CONFIG` at install time) it is **pinned** into the unit/task, so
+the service runs that instance. Install refuses to overwrite (and uninstall to remove) a
+unit/task it did not write (marker in the unit file / task description).
+`uninstall --purge --yes` also deletes the config dir (config, identity key, audit and
+daemon logs) and, for the default instance, the MCP cache; without `--yes` it only lists
+what it would delete.
+
+**Logs.** The service/task runs `enishi up --log-file`: tracing goes to stderr (journald
+on Linux) **and** to `<config dir>/enishi.log` (no ANSI), rotated at 5 MiB to
+`enishi.log.1` (one generation). Panics are logged there too (a windowless daemon has no
+stderr). `enishi logs [-n N] [-f]` prints/follows it across rotations.
+
 **Windows**
 - The daemon must run **in the user's interactive session**, not as a service (session 0
-  can't touch the desktop). Installer registers a **logon scheduled task**; an optional
-  tiny SYSTEM service for presence/wake before logon is v0.3+.
-- Installer adds a firewall rule scoped to `enishi.exe`, private profile only (PoC showed
-  the default prompt allows Public too).
+  can't touch the desktop). It is a **logon scheduled task** (`schtasks /Create /XML`,
+  Task Scheduler 1.2 schema): `LogonTrigger` for the current user, `InteractiveToken`
+  (runs only while the user is logged on, in session 1+, no stored password),
+  `LeastPrivilege`, `ExecutionTimeLimit PT0S`, `RestartOnFailure` every 1 min (999×),
+  `MultipleInstancesPolicy IgnoreNew`, battery restrictions off, priority 5 (normal —
+  the schtasks default 7 would make every `exec` child below-normal). An optional tiny
+  SYSTEM service for presence/wake before logon is v0.3+.
+- **No console window**: install puts two copies in `%LOCALAPPDATA%\Programs\enishi`:
+  `enishi.exe` (console subsystem, the CLI; that dir is added to the **user** `PATH` in
+  `HKCU\Environment`, keeping `REG_EXPAND_SZ`, + `WM_SETTINGCHANGE` broadcast) and
+  `enishiw.exe`, the same image with the PE optional-header *Subsystem* field flipped to
+  GUI (what `editbin /SUBSYSTEM:WINDOWS` does; 2 bytes, checksum not enforced for
+  user-mode images). The task runs `enishiw.exe up --log-file`: Windows never allocates a
+  console for it, so nothing flashes or stays open, independent of how the task is
+  started (a hidden-window task setting or a `--background` re-spawn can still flash or
+  leave a conhost). Children it spawns already use `CREATE_NO_WINDOW`. Without a console,
+  Ctrl-C handler registration fails; the daemon then just waits (stopped by the task /
+  `TerminateProcess`).
+- **Upgrade with the exe locked**: install ends the task, terminates any process whose
+  image path is exactly the installed `enishiw.exe` (never by name — a dev/live
+  `enishi.exe` elsewhere is untouched), then for each file deletes it or, if still locked
+  (e.g. the CLI copy running the install), renames it to `*.old-<ms>` (allowed for a
+  running image) and writes the new one; leftovers are cleaned on the next
+  install/uninstall. Uninstall run from the installed `enishi.exe` deletes that file from
+  a detached `cmd` after it exits.
+- **Firewall** (`install --firewall` or `enishi firewall`): one inbound **UDP** rule named
+  after the install, **Private profile only**, scoped to `enishiw.exe` and `enishi.exe`;
+  it first deletes every rule bound to those program paths (what the "allow access"
+  prompt creates: TCP+UDP, often Public too). Needs admin: when not elevated, install
+  prints the exact one-line `Start-Process -Verb RunAs …` command instead of failing, and
+  a default install prints it as a hint. Uninstall removes the rule (or prints the
+  elevated command).
 - Default `exec` shell: PowerShell (pwsh if present, else Windows PowerShell 5.1).
 - Interactive `shell` uses ConPTY.
 
 **Linux**
-- `systemd --user` unit (+ `loginctl enable-linger` for headless servers).
+- `systemd --user` unit `~/.config/systemd/user/<name>.service`: `ExecStart=<bin> up
+  --log-file`, `Restart=on-failure`, `WantedBy=default.target`, pinned config as
+  `Environment=ENISHI_CONFIG=…`; `daemon-reload`, `enable`, `restart` (so an upgrade picks
+  the new binary up; the binary itself is replaced by an atomic rename, safe while it
+  runs). Binary in `~/.local/bin/enishi` (or `--prefix`). Install checks
+  `loginctl show-user $USER -p Linger` and, if off, prints the
+  `sudo loginctl enable-linger <user>` hint for headless servers (never runs sudo).
 - Local IPC: Unix socket (0600) in `$XDG_RUNTIME_DIR/enishi.sock`, falling back to the
   config dir. Windows: named pipe `\\.\pipe\enishi-<user>` (remote clients rejected).
   Instances started with a non-default `--config` use `<config dir>/enishi.sock` /
   `\\.\pipe\enishi-<user>-<hash of config path>`.
+
+**Releases.** Tag `vX.Y.Z` (must equal the crate version) → `.github/workflows/release.yml`
+tests and builds `x86_64-unknown-linux-gnu` (on ubuntu-22.04 for an older glibc) and
+`x86_64-pc-windows-msvc`, and publishes a GitHub Release with the two binaries and
+`SHA256SUMS`. The README's one-liners download a binary, verify it against `SHA256SUMS`
+and run `install` (integrity only: both files come from the same release).
 
 ## 8. Repository layout
 
@@ -488,12 +552,13 @@ crates/
   enishi-svc       service host: process spawn, PTY/ConPTY, exec, stdio services
   enishi-mcp       MCP shim (cache, offline replies, handshake replay)
   enishi           the CLI binary (clap) — thin, wires everything
-docs/              design, protocol, security, install
-packaging/         windows (task + firewall + installer), linux (systemd unit)
+docs/              design, examples
 ```
 
-CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
-`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`.
+Packaging needs no `packaging/` dir: the unit, the task XML and the firewall rule are
+generated by `enishi install` (`crates/enishi/src/install/`, pure renderers unit-tested on
+every OS). CI (GitHub Actions): fmt, clippy, tests on Linux + Windows; tag `v*` → release
+builds for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` + `SHA256SUMS` (§7).
 
 ## 9. Milestones
 
@@ -522,3 +587,4 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | **D12** | Raw spawns (services, `exec --raw`, transparent MCP) resolve the program on Windows through `PATH` × `PATHEXT` (never the cwd) to a full path; `.cmd`/`.bat` are then launched by Rust std, which since 1.77 runs them via `cmd.exe /e:ON /v:OFF /d /c` with BatBadBut-safe quoting (and refuses args it cannot quote safely). |
 | **D13** | Transparent MCP (`enishi mcp -d dev -- cmd…`) needs its own grant `mcp = true` (`McpPolicy`, same enum as `ExecPolicy`, one `authorize_mcp`). `exec = true` does not imply it: `exec` is for humans/scripts with a shell, `mcp` is what an agent config may trigger unattended; keeping them apart lets a device allow one without the other (and later allowlist MCP packages only). Published services keep working with services grants alone. |
 | **D14** | TCP forwarding: `kind = "tcp"` services (`target`), one QUIC bi-stream per TCP connection on the warm stream connection, connect-before-ack, half-close preserved, fast fail while the peer is offline with the listener kept. Listeners live in the daemon (`enishi forward` holds one for its lifetime; `[forwards.*]` for the daemon's). |
+| **D15** | Packaging is the binary itself: `enishi install/uninstall` per user (systemd user unit / logon scheduled task + user PATH), no admin except the optional Private-only firewall rule; idempotent re-install = upgrade; an install record makes uninstall exact. Windows runs a GUI-subsystem copy (`enishiw.exe`) so the daemon never has a console window. The service logs to a 5 MiB-rotated file in the config dir (`enishi logs`). |

@@ -14,7 +14,7 @@ It was built for AI agents that live on a server but need to act on your PC (you
 your apps, your corporate VPN), and it is just as useful from a plain terminal.
 
 Status: **v0.1 in progress** — link, presence, pairing, `exec`, services, MCP and TCP forwarding
-work and are tested Linux ↔ Windows. Packaging (installers, autostart) is next.
+work and are tested Linux ↔ Windows, and `enishi install` sets it up as a per-user service.
 
 ## What enishi is (and is not)
 
@@ -27,11 +27,60 @@ work and are tested Linux ↔ Windows. Packaging (installers, autostart) is next
 MCP support is a layer on top of the generic service machinery, not the core. On Windows the
 daemon runs in the user's session (not session 0), so UI-capable tools work.
 
+## Install
+
+Per user, no admin rights. Download the binary for your OS from the
+[latest release](https://github.com/rauldev-yoru/enishi/releases/latest) (or build it:
+`cargo build --release -p enishi`), check it against `SHA256SUMS`, then let it install itself:
+
+```bash
+enishi install          # copy to ~/.local/bin (Linux) or %LOCALAPPDATA%\Programs\enishi (Windows),
+                        # register autostart, start the daemon
+enishi status
+enishi logs -f          # the daemon's log (enishi.log in the config dir)
+```
+
+One-liners doing exactly that (download, verify the checksum, install):
+
+```bash
+# Linux x86_64
+cd "$(mktemp -d)" && u=https://github.com/rauldev-yoru/enishi/releases/latest/download && curl -fsSL -O "$u/enishi-x86_64-unknown-linux-gnu" -O "$u/SHA256SUMS" && sha256sum --ignore-missing -c SHA256SUMS && chmod +x enishi-x86_64-unknown-linux-gnu && ./enishi-x86_64-unknown-linux-gnu install
+```
+
+```powershell
+# Windows x86_64 (PowerShell)
+$u='https://github.com/rauldev-yoru/enishi/releases/latest/download'; $f="$env:TEMP\enishi-setup.exe"; iwr "$u/enishi-x86_64-pc-windows-msvc.exe" -OutFile $f; iwr "$u/SHA256SUMS" -OutFile "$f.sums"; if ((Get-FileHash $f).Hash -ne (Select-String windows "$f.sums").Line.Split(' ')[0]) { throw 'checksum mismatch' }; & $f install
+```
+
+(The checksum guards against a corrupted or swapped download; it comes from the same release,
+so it is not a signature.)
+
+What `install` does:
+
+- **Linux**: binary in `~/.local/bin/enishi`, a `systemd --user` unit (`enishi.service`,
+  `Restart=on-failure`) enabled and started. For a headless server that should run enishi
+  without anyone logged in, it prints the `sudo loginctl enable-linger $USER` command if
+  lingering is off.
+- **Windows**: `enishi.exe` (CLI, added to your user `PATH`) and `enishiw.exe` (the same
+  program built as a windowless app) in `%LOCALAPPDATA%\Programs\enishi`, and a logon
+  scheduled task running `enishiw.exe up` in your session: starts when you log on, restarts on
+  failure, no time limit, no console window. The firewall rule is optional and the only step
+  that needs admin: `enishi install --firewall` (or `enishi firewall` later) adds one inbound rule
+  for enishi on **Private** networks only and removes the broader ones Windows creates on first
+  use; when not elevated it prints the one-line command to run it with a UAC prompt.
+
+Re-running `enishi install` from a newer binary upgrades in place (stops the daemon, swaps the
+files, starts it again). `enishi uninstall` removes the service/task, the `PATH` entry and the
+binaries; `--purge --yes` also deletes the config, the device identity and the logs.
+Options: `--prefix DIR` (install dir), `--name NAME` (unit/task name, to run a second instance,
+e.g. with `--config`), `--no-start`. A non-default config (`--config` / `ENISHI_CONFIG`) given at
+install time is pinned into the service.
+
 ## Quick start
 
 ```bash
 # on both devices
-enishi up                                  # the daemon (packaging will autostart it)
+enishi install                             # or run `enishi up` in a terminal
 
 # device A
 enishi pair invite                         # prints a one-time code (valid 10 min)
