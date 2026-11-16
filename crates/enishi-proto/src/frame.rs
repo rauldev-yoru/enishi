@@ -15,7 +15,10 @@ pub enum FrameError {
     /// Declared or encoded body length exceeds [`MAX_FRAME`].
     TooLarge(usize),
     /// Fewer bytes than the header announces.
-    Truncated { expected: usize, got: usize },
+    Truncated {
+        expected: usize,
+        got: usize,
+    },
     Codec(postcard::Error),
 }
 

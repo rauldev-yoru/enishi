@@ -15,6 +15,8 @@ pub mod exit {
     pub const NOT_ALLOWED: i32 = 254;
     pub const NO_SUCH_SERVICE: i32 = 253;
     pub const DAEMON_DOWN: i32 = 252;
+    /// Bad invocation (unknown device, missing config…), same as clap's usage errors.
+    pub const USAGE: i32 = 2;
 }
 
 /// First frame of every session stream.

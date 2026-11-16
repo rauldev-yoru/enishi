@@ -13,7 +13,10 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Status(StatusReport),
     /// `code` is one of [`crate::exit`].
-    Error { code: i32, message: String },
+    Error {
+        code: i32,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

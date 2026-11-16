@@ -1,4 +1,7 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
+use enishi_core::{identity, paths::Paths};
 
 /// 縁 enishi — a native link between your devices.
 #[derive(Parser)]
@@ -7,6 +10,9 @@ struct Cli {
     /// Target device (defaults to `default_peer` in enishi.toml)
     #[arg(short = 'd', long = "device", global = true)]
     device: Option<String>,
+    /// Path to enishi.toml (default: ~/.config/enishi/enishi.toml, %APPDATA%\enishi\enishi.toml)
+    #[arg(long, global = true, env = "ENISHI_CONFIG")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -65,9 +71,14 @@ enum PairCmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let paths = Paths::resolve(cli.config.as_deref())?;
     let name = match &cli.cmd {
+        Cmd::Id => {
+            let key = identity::load_or_create(&paths.identity_key())?;
+            println!("{}", key.public());
+            return Ok(());
+        }
         Cmd::Up => "up",
-        Cmd::Id => "id",
         Cmd::Pair { .. } => "pair",
         Cmd::Status => "status",
         Cmd::Exec { .. } => "exec",
