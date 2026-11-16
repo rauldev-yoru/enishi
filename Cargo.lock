@@ -692,6 +692,9 @@ dependencies = [
  "anyhow",
  "clap",
  "enishi-core",
+ "enishi-proto",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -699,6 +702,7 @@ name = "enishi-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "enishi-proto",
  "iroh",
  "serde",
  "tokio",
