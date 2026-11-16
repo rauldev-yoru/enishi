@@ -101,7 +101,11 @@ As implemented (v0.1 step 3):
   job object, terminated as a whole. The tree is killed on `--timeout`, when the caller
   goes away (CLI killed, link lost) and when the session is dropped.
 - After the process exits, output from background children still holding the pipes is
-  forwarded until it is quiet for 500 ms, then the tree is killed.
+  forwarded until it is quiet for 500 ms, then the tree is killed. The session ends when
+  the exit status is known **and** both pipes reached EOF (or went quiet): the exit code
+  has to wait for the process to be reaped, and EOF normally arrives with the exit, so
+  there is no teardown wait to shave (the `exec in` log line records `eof=` and
+  `reaped=` separately to show it).
 - More reserved codes, shell-style: `124` timeout (tree killed), `126` cannot execute
   (e.g. bad `--cwd`), `127` command not found (raw mode). A remote process may of course
   exit with any of these itself.
@@ -198,7 +202,8 @@ connection per peer with this ALPN, dialed right after the ctl hello and dropped
    `signal` frames are not implemented yet.
 
 Both ends log one timing line per session (`exec out`: ack / first byte / end / bytes;
-`exec in`: spawn / first output / exit / out+err bytes) and append an audit line.
+`exec in`: spawn / first output / pipes EOF / reaped / exit / out+err bytes) and append
+an audit line.
 
 Framing: length-prefixed **postcard** frames (D3); the PoC used raw bytes + newline
 header.

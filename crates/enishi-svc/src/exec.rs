@@ -227,6 +227,10 @@ pub struct Outcome {
     pub spawn: Duration,
     pub first_out: Option<Duration>,
     pub total: Duration,
+    /// When both stdout and stderr reached EOF, if they did.
+    pub eof: Option<Duration>,
+    /// When the process' exit status was collected, if it was.
+    pub exited: Option<Duration>,
     pub out_bytes: u64,
     pub err_bytes: u64,
 }
@@ -381,6 +385,7 @@ impl Running {
         let mut first_out = None;
         let mut status: Option<i32> = None;
         let mut drained = false;
+        let (mut eof, mut exited) = (None, None);
         let mut quiet_since = Instant::now();
         let end = loop {
             if let (Some(code), true) = (status, drained) {
@@ -392,10 +397,14 @@ impl Running {
                 _ = until(deadline) => break End::TimedOut,
                 s = self.child.wait(), if status.is_none() => {
                     status = Some(exit_code(s));
+                    exited = Some(self.t0.elapsed());
                     quiet_since = Instant::now();
                 }
                 f = rx.recv(), if !drained => match f {
-                    None => drained = true,
+                    None => {
+                        drained = true;
+                        eof = Some(self.t0.elapsed());
+                    }
                     Some(f) => {
                         first_out.get_or_insert_with(|| self.t0.elapsed());
                         match &f {
@@ -429,6 +438,8 @@ impl Running {
             spawn: self.spawn,
             first_out,
             total: self.t0.elapsed(),
+            eof,
+            exited,
             out_bytes,
             err_bytes,
         }

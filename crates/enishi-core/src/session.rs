@@ -356,10 +356,12 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     };
     info!(
         peer = %peer.name,
-        "exec in `{}`: spawn={}ms first_out={}ms exit={}ms out={}B err={}B result={}",
+        "exec in `{}`: spawn={}ms first_out={}ms eof={}ms reaped={}ms exit={}ms out={}B err={}B result={}",
         show(&req.command),
         ms(out.spawn),
         out.first_out.map(ms).unwrap_or_else(|| "-".into()),
+        out.eof.map(ms).unwrap_or_else(|| "-".into()),
+        out.exited.map(ms).unwrap_or_else(|| "-".into()),
         ms(out.total),
         out.out_bytes,
         out.err_bytes,
