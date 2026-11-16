@@ -306,7 +306,7 @@ pub async fn run(paths: &Paths, device: Option<String>, mut args: UpdateArgs) ->
 }
 
 /// The install `name`, or the one whose binary is running, or `enishi`.
-fn resolve_install(name: Option<&str>) -> Result<Manifest> {
+pub(super) fn resolve_install(name: Option<&str>) -> Result<Manifest> {
     let name = match name {
         Some(n) => n.to_string(),
         None => own_install()
@@ -341,7 +341,7 @@ pub fn own_install() -> Option<Manifest> {
 }
 
 /// Paths of the config the installed daemon runs.
-fn instance_paths(m: &Manifest) -> Result<Paths> {
+pub(super) fn instance_paths(m: &Manifest) -> Result<Paths> {
     Paths::resolve(m.config.as_deref())
 }
 

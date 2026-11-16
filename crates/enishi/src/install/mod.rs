@@ -72,6 +72,16 @@ pub struct UninstallArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct RestartArgs {
+    /// Install to restart (default: the one this binary belongs to, else `enishi`)
+    #[arg(long, value_parser = parse_name)]
+    pub name: Option<String>,
+    /// Internal: the one-shot task running a detached restart (deleted when done)
+    #[arg(long, hide = true)]
+    pub task: Option<String>,
+}
+
+#[derive(Args, Debug)]
 pub struct FirewallArgs {
     /// Install name (the rule is named after it)
     #[arg(long, default_value = "enishi", value_parser = parse_name)]
@@ -247,6 +257,52 @@ pub async fn install(paths: &Paths, args: InstallArgs) -> Result<ExitCode> {
             ExitCode::FAILURE
         })
     }
+}
+
+/// Restart the installed daemon (bug #12): Linux `systemctl --user restart`; Windows
+/// end the task, wait for the installed daemon binary (by exact path) to exit — killing it
+/// after 10 s — and run the task again. Then wait until the new daemon answers.
+pub async fn restart(args: RestartArgs) -> Result<ExitCode> {
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = args;
+        bail!("`enishi restart` supports Linux (systemd --user) and Windows only");
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let m = update::resolve_install(args.name.as_deref())?;
+        let ipaths = update::instance_paths(&m)?;
+        let res = restart_installed(&m, &ipaths).await;
+        if let Some(t) = &args.task {
+            platform::delete_task(t);
+        }
+        res
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+async fn restart_installed(m: &Manifest, ipaths: &Paths) -> Result<ExitCode> {
+    if platform::inside_daemon(m) {
+        // Stopping the daemon would take this process (its child) down with it: hand the
+        // restart to a copy outside the daemon's unit / job.
+        let unit = format!("{}-restart-{}", m.name, std::process::id());
+        let a: Vec<String> = vec!["restart".into(), "--name".into(), m.name.clone()];
+        let method = platform::spawn_detached(&m.bin, &a, &ipaths.log_file(), &unit)
+            .context("starting the detached restart")?;
+        println!(
+            "restarting {} from outside the daemon ({method}); this session ends now, the \
+             daemon is back in a few seconds",
+            m.name
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let what = platform::restart(m)?;
+    println!("{what}");
+    Ok(if wait_for_daemon(ipaths, &m.name).await {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 pub async fn uninstall(paths: &Paths, args: UninstallArgs) -> Result<ExitCode> {

@@ -385,6 +385,12 @@ pub fn start(m: &Manifest) -> Result<String> {
     Ok(format!("systemctl --user start {unit}"))
 }
 
+pub fn restart(m: &Manifest) -> Result<String> {
+    let unit = format!("{}.service", m.name);
+    systemctl(&["restart", &unit])?;
+    Ok(format!("systemctl --user restart {unit}"))
+}
+
 /// Write an installed binary (rename over: fine while it runs).
 pub fn put(bytes: &[u8], dst: &Path) -> Result<()> {
     copy_atomic(bytes, dst)

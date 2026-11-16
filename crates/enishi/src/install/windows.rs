@@ -693,8 +693,14 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// Terminate every process whose image is exactly `exe`, waiting for each to exit.
-fn kill_by_path(exe: &Path) -> usize {
+/// Call `f` with a handle (`access` plus query rights) to every process whose image is
+/// exactly `exe` — matched by full path, never by name alone — except this one; the number
+/// of processes for which `f` returned true.
+fn for_each_by_path(
+    exe: &Path,
+    access: u32,
+    mut f: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> bool,
+) -> usize {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
         System::{
@@ -704,8 +710,7 @@ fn kill_by_path(exe: &Path) -> usize {
             },
             Threading::{
                 OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW,
-                TerminateProcess, WaitForSingleObject,
+                QueryFullProcessImageNameW,
             },
         },
     };
@@ -715,7 +720,7 @@ fn kill_by_path(exe: &Path) -> usize {
         .map(|f| f.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let me = std::process::id();
-    let mut killed = 0;
+    let mut n = 0;
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
@@ -733,21 +738,16 @@ fn kill_by_path(exe: &Path) -> usize {
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]).to_lowercase();
             if pid != me && name == file_name {
-                let h = OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
-                    0,
-                    pid,
-                );
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, 0, pid);
                 if !h.is_null() {
                     let mut buf = [0u16; 1024];
-                    let mut n = buf.len() as u32;
-                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n)
+                    let mut len = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
                         != 0
-                        && String::from_utf16_lossy(&buf[..n as usize]).to_lowercase() == want
-                        && TerminateProcess(h, 1) != 0
+                        && String::from_utf16_lossy(&buf[..len as usize]).to_lowercase() == want
+                        && f(h)
                     {
-                        WaitForSingleObject(h, 5000);
-                        killed += 1;
+                        n += 1;
                     }
                     CloseHandle(h);
                 }
@@ -756,11 +756,42 @@ fn kill_by_path(exe: &Path) -> usize {
         }
         CloseHandle(snap);
     }
+    n
+}
+
+/// Terminate every process whose image is exactly `exe`, waiting for each to exit.
+fn kill_by_path(exe: &Path) -> usize {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+    let killed = for_each_by_path(exe, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, |h| unsafe {
+        if TerminateProcess(h, 1) != 0 {
+            WaitForSingleObject(h, 5000);
+            true
+        } else {
+            false
+        }
+    });
     if killed > 0 {
         // Let the loader release the image file.
         std::thread::sleep(Duration::from_millis(200));
     }
     killed
+}
+
+/// Wait up to `timeout` (in total) for every process whose image is exactly `exe` to
+/// exit; how many are still running.
+fn wait_exit_by_path(exe: &Path, timeout: Duration) -> usize {
+    use windows_sys::Win32::{
+        Foundation::WAIT_OBJECT_0,
+        System::Threading::{PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    for_each_by_path(exe, PROCESS_SYNCHRONIZE, |h| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = left.as_millis().min(u32::MAX as u128) as u32;
+        unsafe { WaitForSingleObject(h, ms) != WAIT_OBJECT_0 }
+    })
 }
 
 fn norm_dir(s: &str) -> String {
@@ -966,6 +997,35 @@ pub fn stop(m: &Manifest) -> Result<String> {
         "schtasks /End /TN {}{}; {killed} daemon process(es) terminated",
         m.name,
         if ended { "" } else { " (not running)" }
+    ))
+}
+
+/// How long `enishi restart` lets the ended daemon exit on its own before killing it.
+const RESTART_EXIT_WAIT: Duration = Duration::from_secs(10);
+
+/// `schtasks /End` returns before the daemon has exited, and a `/Run` meanwhile starts an
+/// instance that finds the old one still holding the IPC pipe (bug #12): wait for the
+/// installed daemon binary (by exact path) to be gone first.
+pub fn restart(m: &Manifest) -> Result<String> {
+    let daemon = m
+        .daemon_bin
+        .as_deref()
+        .context("the install record has no daemon binary (reinstall)")?;
+    let ended = schtasks(&["/End", "/TN", &m.name]).is_ok();
+    let t0 = std::time::Instant::now();
+    let left = wait_exit_by_path(daemon, RESTART_EXIT_WAIT);
+    let killed = if left > 0 { kill_by_path(daemon) } else { 0 };
+    let waited = t0.elapsed().as_secs_f64();
+    schtasks(&["/Run", "/TN", &m.name]).context("starting the task")?;
+    Ok(format!(
+        "schtasks /End /TN {n}{}; old daemon gone after {waited:.1}s{}; schtasks /Run /TN {n}",
+        if ended { "" } else { " (was not running)" },
+        if killed > 0 {
+            format!(" ({killed} process(es) killed after {RESTART_EXIT_WAIT:?})")
+        } else {
+            String::new()
+        },
+        n = m.name,
     ))
 }
 

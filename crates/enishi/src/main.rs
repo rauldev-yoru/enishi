@@ -58,6 +58,9 @@ enum Cmd {
     /// Update the installed enishi (newest release, --version, or --from-file); with
     /// -d <device>, update that device (needs its `update` grant)
     Update(Box<install::update::UpdateArgs>),
+    /// Restart the installed daemon (systemd user unit / logon task) and wait until it
+    /// answers
+    Restart(install::RestartArgs),
     /// Reverse `enishi install` (--purge --yes also deletes config, identity and cache)
     Uninstall(install::UninstallArgs),
     /// Windows: add (or --remove, --check) the Private-only firewall rule (asks for UAC once)
@@ -247,6 +250,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Logs { follow, lines } => logging::show(&paths.log_file(), lines, follow),
         Cmd::Install(args) => install::install(&paths, args).await,
         Cmd::Update(args) => install::update::run(&paths, cli.device, *args).await,
+        Cmd::Restart(args) => {
+            if let Some(d) = cli.device {
+                eprintln!(
+                    "enishi: `restart` acts on this machine's install; for {d}: \
+                     `enishi -d {d} exec -- enishi restart`"
+                );
+                return Ok(ExitCode::from(exit::USAGE as u8));
+            }
+            install::restart(args).await
+        }
         Cmd::Uninstall(args) => install::uninstall(&paths, args).await,
         Cmd::Firewall(args) => install::firewall(args),
     }
