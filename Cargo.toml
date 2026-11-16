@@ -11,6 +11,13 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+iroh = "1.4.1"
+postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+enishi-proto = { path = "crates/enishi-proto" }
+enishi-core = { path = "crates/enishi-core" }

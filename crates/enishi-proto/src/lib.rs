@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ctl;
+pub mod frame;
+pub mod ipc;
+
 pub const ALPN_CTL: &[u8] = b"enishi/ctl/1";
 pub const ALPN_STREAM: &[u8] = b"enishi/stream/1";
 
