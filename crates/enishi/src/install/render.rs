@@ -237,20 +237,6 @@ pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// One line to paste in any PowerShell: re-runs `enishi firewall` elevated (UAC prompt).
-pub fn elevated_firewall_cmd(cli: &Path, name: &str, prefix: &Path) -> String {
-    let args = format!(
-        "firewall --name {} --prefix {}",
-        win_arg(name),
-        win_arg(&prefix.to_string_lossy())
-    );
-    format!(
-        "Start-Process -Verb RunAs -Wait -FilePath {} -ArgumentList {}",
-        ps_quote(&cli.to_string_lossy()),
-        ps_quote(&args)
-    )
-}
-
 /// One line that removes, elevated, our named rule and every rule bound to the given
 /// program paths (the ones Windows' "allow access" prompt creates). Needs no enishi binary,
 /// so uninstall can print it after deleting the files.
@@ -321,15 +307,7 @@ mod tests {
         assert_eq!(win_arg(r"C:\a b\"), r#""C:\a b\\""#);
         assert_eq!(win_arg(r#"x"y"#), r#""x\"y""#);
         assert_eq!(win_arg(""), "\"\"");
-        let c = elevated_firewall_cmd(
-            Path::new(r"C:\P\enishi.exe"),
-            "enishi",
-            Path::new(r"C:\Users\o'neil\P"),
-        );
-        assert_eq!(
-            c,
-            r"Start-Process -Verb RunAs -Wait -FilePath 'C:\P\enishi.exe' -ArgumentList 'firewall --name enishi --prefix C:\Users\o''neil\P'"
-        );
+        assert_eq!(ps_quote(r"C:\Users\o'neil"), r"'C:\Users\o''neil'");
         assert_eq!(
             elevated_firewall_remove_cmd("enishi", &[Path::new(r"C:\P\enishiw.exe")]),
             r#"Start-Process -Verb RunAs -Wait -FilePath cmd -ArgumentList '/c netsh advfirewall firewall delete rule name="enishi" & netsh advfirewall firewall delete rule name=all program="C:\P\enishiw.exe"'"#

@@ -57,7 +57,7 @@ enum Cmd {
     Install(install::InstallArgs),
     /// Reverse `enishi install` (--purge --yes also deletes config, identity and cache)
     Uninstall(install::UninstallArgs),
-    /// Windows: add (or --remove) the Private-only firewall rule for enishi (needs admin)
+    /// Windows: add (or --remove, --check) the Private-only firewall rule (asks for UAC once)
     Firewall(install::FirewallArgs),
     /// Print this device's public id
     Id,

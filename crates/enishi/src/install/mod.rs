@@ -1,6 +1,6 @@
 //! `enishi install` / `enishi uninstall` / `enishi firewall`: per-user installation as a
-//! systemd user unit (Linux) or a logon scheduled task (Windows). No admin rights needed,
-//! except for the optional Windows firewall rule.
+//! systemd user unit (Linux) or a logon scheduled task (Windows). No admin rights needed;
+//! the firewall step asks for them once (Windows: one UAC prompt; Linux: an offered `sudo`).
 
 use std::{
     path::{Path, PathBuf},
@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 mod linux;
-// Pure generators for every platform (tested everywhere); each OS uses its half.
+// Pure generators and decisions for every platform (tested everywhere); each OS uses its
+// half.
+#[allow(dead_code)]
+pub mod firewall;
 #[allow(dead_code)]
 pub mod render;
 #[cfg(windows)]
@@ -38,9 +41,12 @@ pub struct InstallArgs {
     /// Register autostart but do not (re)start the daemon now
     #[arg(long)]
     pub no_start: bool,
-    /// Windows: add an inbound firewall rule for enishi, Private profile only (needs admin;
-    /// prints the elevated command otherwise)
+    /// Skip the firewall step (Windows: the UAC prompt for the Private-only rule; Linux:
+    /// the firewalld/ufw check)
     #[arg(long)]
+    pub no_firewall: bool,
+    /// Kept for compatibility: the firewall step is now the default
+    #[arg(long, hide = true, conflicts_with = "no_firewall")]
     pub firewall: bool,
 }
 
@@ -56,6 +62,9 @@ pub struct UninstallArgs {
     /// Confirm --purge
     #[arg(long, requires = "purge")]
     pub yes: bool,
+    /// Windows: do not ask (UAC) to remove the firewall rules; print the command instead
+    #[arg(long)]
+    pub no_firewall: bool,
 }
 
 #[derive(Args, Debug)]
@@ -66,9 +75,15 @@ pub struct FirewallArgs {
     /// Install directory [default: the one recorded at install, else the default]
     #[arg(long, value_name = "DIR")]
     pub prefix: Option<PathBuf>,
-    /// Remove the rule instead
+    /// Remove the rules instead
     #[arg(long)]
     pub remove: bool,
+    /// Only report whether the rules are as enishi wants them (exit 1 if not); no changes
+    #[arg(long, conflicts_with = "remove")]
+    pub check: bool,
+    /// Internal: this is the elevated helper; never re-elevate
+    #[arg(long, hide = true)]
+    pub elevated: bool,
 }
 
 fn parse_name(s: &str) -> Result<String, String> {
@@ -176,6 +191,9 @@ pub struct Ctx {
     /// Config to pin into the unit/task (non-default only).
     pub pinned_config: Option<PathBuf>,
     pub current_exe: PathBuf,
+    /// `[device] listen_port` of the config the service runs (Linux firewall check).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub listen_port: Option<u16>,
 }
 
 pub async fn install(paths: &Paths, args: InstallArgs) -> Result<ExitCode> {
@@ -189,11 +207,15 @@ pub async fn install(paths: &Paths, args: InstallArgs) -> Result<ExitCode> {
         let current_exe = std::env::current_exe()
             .and_then(|p| p.canonicalize().or(Ok(p)))
             .context("cannot locate the running enishi binary")?;
+        let created_config = ensure_config(paths)?;
+        let listen_port = enishi_core::config::Config::load(&paths.config_file)
+            .ok()
+            .and_then(|c| c.device.listen_port);
         let ctx = Ctx {
             pinned_config: paths.custom.then(|| paths.config_file.clone()),
             current_exe,
+            listen_port,
         };
-        let created_config = ensure_config(paths)?;
         let previous = Manifest::load(&args.name)?;
         let mut m = platform::install(&ctx, &args, previous.as_ref())?;
         m.created_config = created_config || previous.is_some_and(|p| p.created_config);
@@ -237,7 +259,7 @@ pub async fn uninstall(paths: &Paths, args: UninstallArgs) -> Result<ExitCode> {
                 args.name
             );
         }
-        platform::uninstall(&args.name, m.as_ref())?;
+        platform::uninstall(&args.name, m.as_ref(), args.no_firewall)?;
         Manifest::remove(&args.name)?;
         if args.purge {
             for d in purge_targets(paths, m.as_ref()) {
@@ -261,7 +283,9 @@ pub fn firewall(args: FirewallArgs) -> Result<ExitCode> {
     #[cfg(not(windows))]
     {
         let _ = args;
-        println!("enishi firewall only applies to Windows; nothing to do here");
+        println!(
+            "enishi firewall only applies to Windows; on Linux `enishi install` checks firewalld/ufw"
+        );
         Ok(ExitCode::SUCCESS)
     }
 }

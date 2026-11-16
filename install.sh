@@ -33,4 +33,10 @@ curl -fsSL -o SHA256SUMS "$base/SHA256SUMS" || die "download failed: $base/SHA25
 grep " $ASSET\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1 || die "checksum mismatch for $ASSET"
 say "checksum ok"
 chmod +x "$ASSET"
-./"$ASSET" install "$@"
+# `curl | sh` makes stdin the script pipe: give install the terminal so it can ask about
+# the firewall (it only prints the sudo command when there is no terminal).
+if [ -t 1 ] && (: </dev/tty) 2>/dev/null; then
+  ./"$ASSET" install "$@" </dev/tty
+else
+  ./"$ASSET" install "$@"
+fi

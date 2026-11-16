@@ -2,7 +2,7 @@
 #   irm https://raw.githubusercontent.com/rauldev-yoru/enishi/main/install.ps1 | iex
 # From cmd:  powershell -NoProfile -c "irm https://raw.githubusercontent.com/rauldev-yoru/enishi/main/install.ps1 | iex"
 # Env: $env:ENISHI_VERSION = 'v0.1.0' to pin a release (default: newest, pre-releases included).
-#      $env:ENISHI_INSTALL_ARGS = '--firewall' to pass extra args to `enishi install`.
+#      $env:ENISHI_INSTALL_ARGS = '--no-firewall' to pass extra args to `enishi install`.
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'

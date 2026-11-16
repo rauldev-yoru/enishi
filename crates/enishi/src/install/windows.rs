@@ -1,5 +1,6 @@
 //! Windows: `%LOCALAPPDATA%\Programs\enishi\{enishi.exe, enishiw.exe}`, user PATH, a logon
-//! scheduled task running the windowless copy in the user's session, optional firewall rule.
+//! scheduled task running the windowless copy in the user's session, and the Private-only
+//! firewall rule (one UAC prompt: an elevated helper of the installed `enishi.exe`).
 
 use std::{
     ffi::OsStr,
@@ -11,7 +12,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use super::{Ctx, FirewallArgs, InstallArgs, Manifest, copy_atomic, render, run_cmd, same_file};
+use super::{
+    Ctx, FirewallArgs, InstallArgs, Manifest, copy_atomic,
+    firewall::{self as fw, WinFwState, WinRule},
+    render, run_cmd, same_file,
+};
 
 pub const CLI_EXE: &str = "enishi.exe";
 /// The same binary with the GUI subsystem bit (no console window): what the task runs.
@@ -19,6 +24,9 @@ pub const DAEMON_EXE: &str = "enishiw.exe";
 const MARKER: &str = "Written by `enishi install`";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+/// How long to wait for the UAC prompt to be answered (and the helper to finish) before
+/// carrying on as if it had been declined.
+const ELEVATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn env_path(k: &str) -> Result<PathBuf> {
     std::env::var_os(k)
@@ -150,6 +158,13 @@ pub fn install(ctx: &Ctx, args: &InstallArgs, previous: Option<&Manifest>) -> Re
         args.name,
         current_user()
     );
+    // 5. Firewall, before the daemon first listens: once our rule exists Windows never
+    // shows its own "allow access" prompt (which leaves Block rules when ignored).
+    if args.no_firewall {
+        println!("firewall: skipped (--no-firewall)");
+    } else {
+        ensure_firewall(&args.name, &prefix, &cli);
+    }
     if args.no_start {
         println!("not started now (--no-start); it starts at your next logon");
     } else {
@@ -168,39 +183,7 @@ pub fn install(ctx: &Ctx, args: &InstallArgs, previous: Option<&Manifest>) -> Re
     })
 }
 
-pub fn after_install(ctx: &Ctx, args: &InstallArgs, m: &Manifest) {
-    let prefix = m.bin.parent().unwrap_or(Path::new("."));
-    let rule = &args.name;
-    if args.firewall {
-        if is_elevated() {
-            match firewall_add(rule, prefix) {
-                Ok(()) => println!("firewall: rule {rule:?} (UDP in, Private profile only)"),
-                Err(e) => eprintln!("enishi: firewall rule failed: {e:#}"),
-            }
-        } else {
-            println!(
-                "firewall: needs an elevated shell. Run this in PowerShell (UAC prompt):\n  {}",
-                render::elevated_firewall_cmd(&m.bin, &args.name, prefix)
-            );
-        }
-    } else {
-        let others = other_program_rules(rule, prefix);
-        if !others.is_empty() {
-            println!(
-                "firewall: Windows has rules for enishi that are not scoped by enishi install:"
-            );
-            for o in &others {
-                println!("  {o}");
-            }
-        }
-        if !others.is_empty() || !rule_exists(rule) {
-            println!(
-                "firewall: for one rule scoped to enishi on Private networks only (replacing\n\
-                 those Windows creates on first use, often Public too), run (UAC prompt):\n  {}",
-                render::elevated_firewall_cmd(&m.bin, &args.name, prefix)
-            );
-        }
-    }
+pub fn after_install(ctx: &Ctx, args: &InstallArgs, _m: &Manifest) {
     let cfg = ctx
         .pinned_config
         .as_ref()
@@ -212,7 +195,7 @@ pub fn after_install(ctx: &Ctx, args: &InstallArgs, m: &Manifest) {
     );
 }
 
-pub fn uninstall(name: &str, m: Option<&Manifest>) -> Result<()> {
+pub fn uninstall(name: &str, m: Option<&Manifest>, no_firewall: bool) -> Result<()> {
     match task_xml_of(name) {
         Some(x) if !x.contains(MARKER) => {
             bail!("scheduled task {name:?} was not created by enishi install; leaving it alone")
@@ -237,18 +220,8 @@ pub fn uninstall(name: &str, m: Option<&Manifest>) -> Result<()> {
     if killed > 0 {
         println!("stopped the running daemon ({killed} process)");
     }
-    if rule_exists(name) || !other_program_rules(name, &prefix).is_empty() {
-        if is_elevated() {
-            firewall_remove_all(name, &prefix);
-            println!("removed the firewall rules for enishi");
-        } else {
-            let [d, c] = firewall_programs(&prefix);
-            println!(
-                "firewall rules for enishi remain; removing them needs an elevated shell. Run (UAC prompt):\n  {}",
-                render::elevated_firewall_remove_cmd(name, &[&d, &c])
-            );
-        }
-    }
+    // Before the binaries go: the elevated helper is the installed enishi.exe.
+    remove_firewall_rules(name, &prefix, &m.bin, no_firewall);
     if m.path_added && path_remove(&prefix)? {
         println!("PATH: removed {}", prefix.display());
     }
@@ -346,25 +319,15 @@ fn netsh(line: &str) -> Result<String> {
     run_cmd(hidden("netsh.exe").raw_arg(line))
 }
 
-fn rule_exists(rule: &str) -> bool {
-    netsh(&format!("advfirewall firewall show rule name=\"{rule}\"")).is_ok()
-}
-
 fn firewall_programs(prefix: &Path) -> [PathBuf; 2] {
     [prefix.join(DAEMON_EXE), prefix.join(CLI_EXE)]
 }
 
 /// Inbound UDP (QUIC), Private profile only, scoped to the two enishi binaries; first
-/// removes every rule Windows' "allow access" prompt created for those paths (TCP+UDP,
-/// often Public too).
+/// removes every rule bound to those paths (what Windows' "allow access" prompt creates:
+/// allow or block, TCP+UDP, often Public too) and any previous rule of ours.
 fn firewall_add(rule: &str, prefix: &Path) -> Result<()> {
-    for p in firewall_programs(prefix) {
-        let _ = netsh(&format!(
-            "advfirewall firewall delete rule name=all program=\"{}\"",
-            p.display()
-        ));
-    }
-    let _ = firewall_remove(rule);
+    firewall_remove_all(rule, prefix);
     for p in firewall_programs(prefix) {
         netsh(&format!(
             "advfirewall firewall add rule name=\"{rule}\" dir=in action=allow \
@@ -376,14 +339,9 @@ fn firewall_add(rule: &str, prefix: &Path) -> Result<()> {
     Ok(())
 }
 
-fn firewall_remove(rule: &str) -> Result<()> {
-    netsh(&format!("advfirewall firewall delete rule name=\"{rule}\""))?;
-    Ok(())
-}
-
 /// Our named rule plus every rule bound to the enishi binaries (best effort).
 fn firewall_remove_all(rule: &str, prefix: &Path) {
-    let _ = firewall_remove(rule);
+    let _ = netsh(&format!("advfirewall firewall delete rule name=\"{rule}\""));
     for p in firewall_programs(prefix) {
         let _ = netsh(&format!(
             "advfirewall firewall delete rule name=all program=\"{}\"",
@@ -392,67 +350,316 @@ fn firewall_remove_all(rule: &str, prefix: &Path) {
     }
 }
 
-/// Rules bound to the enishi binaries other than ours, as `name [profiles] proto action`
-/// (read-only query, works unelevated; locale-independent unlike `netsh show`).
-fn other_program_rules(rule: &str, prefix: &Path) -> Vec<String> {
+/// Every rule bound to the enishi binaries or named `rule` (read-only, works unelevated,
+/// locale-independent unlike `netsh show`). `None` if the query failed.
+fn query_rules(rule: &str, prefix: &Path) -> Option<Vec<WinRule>> {
     let progs: Vec<String> = firewall_programs(prefix)
         .iter()
         .map(|p| render::ps_quote(&p.to_string_lossy()))
         .collect();
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         foreach ($p in @({progs})) {{ Get-NetFirewallApplicationFilter -Program $p | \
-         Get-NetFirewallRule | Where-Object {{ $_.DisplayName -ne {rule} }} | ForEach-Object {{ \
-         $proto = ($_ | Get-NetFirewallPortFilter).Protocol; \
-         \"$($_.DisplayName) [$($_.Profile)] $proto $($_.Direction) $($_.Action)\" }} }}",
+         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
+         $rules = @(); \
+         foreach ($p in @({progs})) {{ $rules += @(Get-NetFirewallApplicationFilter -Program $p | Get-NetFirewallRule) }}; \
+         $rules += @(Get-NetFirewallRule -DisplayName {rule}); \
+         $seen = @{{}}; \
+         foreach ($r in $rules) {{ if ($r -and -not $seen.ContainsKey($r.Name)) {{ $seen[$r.Name] = 1; \
+           $prog = ($r | Get-NetFirewallApplicationFilter).Program; \
+           $proto = ($r | Get-NetFirewallPortFilter).Protocol; \
+           \"$($r.DisplayName)`t$($r.Profile)`t$proto`t$($r.Direction)`t$($r.Action)`t$prog`t$($r.Enabled)\" }} }}; \
+         '{ok}'",
         progs = progs.join(","),
         rule = render::ps_quote(rule),
+        ok = fw::WIN_QUERY_OK,
     );
     let out = hidden(r"WindowsPowerShell\v1.0\powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect(),
-        Err(_) => Vec::new(),
+        .output()
+        .ok()?;
+    fw::parse_win_rules(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn rule_state(rule: &str, prefix: &Path) -> Option<(WinFwState, Vec<WinRule>)> {
+    let rules = query_rules(rule, prefix)?;
+    let [d, c] = firewall_programs(prefix);
+    let (d, c) = (d.to_string_lossy(), c.to_string_lossy());
+    Some((fw::win_rule_state(&rules, rule, &[&d, &c]), rules))
+}
+
+/// The one-line hint printed when the rule could not be set.
+fn later_hint(name: &str) -> String {
+    let n = if name == "enishi" {
+        String::new()
+    } else {
+        format!(" --name {name}")
+    };
+    format!(
+        "enishi works without it (links start outbound); to add it later run `enishi firewall{n}`"
+    )
+}
+
+/// Install step: make the rules exactly ours, asking for elevation once if needed.
+fn ensure_firewall(name: &str, prefix: &Path, cli: &Path) {
+    let state = rule_state(name, prefix);
+    if let Some((WinFwState::Correct, _)) = state {
+        println!("firewall: rule {name:?} already in place (UDP in, Private only)");
+        return;
+    }
+    if let Some((WinFwState::Wrong(p), _)) = &state {
+        println!("firewall: fixing the rules for enishi:");
+        for l in p {
+            println!("  {l}");
+        }
+    }
+    if is_elevated() {
+        match firewall_add(name, prefix) {
+            Ok(()) => println!("firewall: rule {name:?} (UDP in, Private profile only)"),
+            Err(e) => eprintln!("enishi: firewall rule failed: {e:#}; {}", later_hint(name)),
+        }
+        return;
+    }
+    println!("firewall: asking Windows for admin rights once (UAC) to add the Private-only rule…");
+    match elevate(cli, &fw::helper_args(name, prefix, false)) {
+        Elevation::Done(0) => match rule_state(name, prefix) {
+            Some((WinFwState::Correct, _)) | None => {
+                println!("firewall: rule {name:?} (UDP in, Private profile only)")
+            }
+            Some((s, _)) => eprintln!(
+                "enishi: firewall rules still not as expected ({s:?}); {}",
+                later_hint(name)
+            ),
+        },
+        other => println!("firewall: {}; {}", other.describe(), later_hint(name)),
+    }
+}
+
+/// Uninstall step: remove our rule and Windows' rules for the binaries (one UAC prompt).
+fn remove_firewall_rules(name: &str, prefix: &Path, cli: &Path, no_firewall: bool) {
+    let rules = query_rules(name, prefix);
+    if rules.as_ref().is_some_and(|r| r.is_empty()) {
+        return;
+    }
+    if is_elevated() {
+        firewall_remove_all(name, prefix);
+        println!("removed the firewall rules for enishi");
+        return;
+    }
+    let print_cmd = |why: &str| {
+        let [d, c] = firewall_programs(prefix);
+        println!(
+            "firewall rules for enishi remain ({why}); remove them from PowerShell (UAC prompt):\n  {}",
+            render::elevated_firewall_remove_cmd(name, &[&d, &c])
+        );
+    };
+    if no_firewall {
+        print_cmd("--no-firewall");
+        return;
+    }
+    let exe = if cli.exists() {
+        cli.to_path_buf()
+    } else {
+        match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => return print_cmd("no enishi.exe to elevate"),
+        }
+    };
+    println!("firewall: asking Windows for admin rights once (UAC) to remove enishi's rules…");
+    match elevate(&exe, &fw::helper_args(name, prefix, true)) {
+        Elevation::Done(0) => println!("removed the firewall rules for enishi"),
+        other => print_cmd(&other.describe()),
     }
 }
 
 pub fn firewall_cmd(args: &FirewallArgs) -> Result<ExitCode> {
     let previous = Manifest::load(&args.name)?;
     let prefix = resolve_prefix(args.prefix.as_ref(), previous.as_ref())?;
-    if !is_elevated() {
-        let cmd = if args.remove {
-            let [d, c] = firewall_programs(&prefix);
-            render::elevated_firewall_remove_cmd(&args.name, &[&d, &c])
+    let name = &args.name;
+    if args.check {
+        return Ok(match rule_state(name, &prefix) {
+            Some((WinFwState::Correct, _)) => {
+                println!(
+                    "firewall: rule {name:?} is in place (UDP in, Private only), nothing else"
+                );
+                ExitCode::SUCCESS
+            }
+            Some((WinFwState::Missing, _)) => {
+                println!("firewall: no rules for enishi under {}", prefix.display());
+                ExitCode::FAILURE
+            }
+            Some((WinFwState::Wrong(p), _)) => {
+                println!("firewall: needs fixing (`enishi firewall`):");
+                for l in p {
+                    println!("  {l}");
+                }
+                ExitCode::FAILURE
+            }
+            None => {
+                eprintln!("enishi: could not query the firewall rules");
+                ExitCode::from(2)
+            }
+        });
+    }
+    if is_elevated() {
+        if args.remove {
+            firewall_remove_all(name, &prefix);
+            println!(
+                "removed the firewall rules for enishi under {}",
+                prefix.display()
+            );
         } else {
-            render::elevated_firewall_cmd(&prefix.join(CLI_EXE), &args.name, &prefix)
-        };
-        eprintln!(
-            "enishi: changing firewall rules needs an elevated shell. Run (UAC prompt):\n  {cmd}"
-        );
-        return Ok(ExitCode::FAILURE);
+            firewall_add(name, &prefix)?;
+            println!(
+                "firewall rule {name:?}: UDP in, Private profile only, for {} and {}",
+                prefix.join(DAEMON_EXE).display(),
+                prefix.join(CLI_EXE).display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
     }
-    if args.remove {
-        firewall_remove_all(&args.name, &prefix);
-        println!(
-            "removed the firewall rules for enishi under {}",
-            prefix.display()
-        );
+    if args.elevated {
+        eprintln!("enishi: the elevated helper is not elevated; giving up");
+        return Ok(ExitCode::from(3));
+    }
+    // Nothing to do without elevation?
+    match (args.remove, rule_state(name, &prefix)) {
+        (false, Some((WinFwState::Correct, _))) => {
+            println!("firewall: rule {name:?} already in place (UDP in, Private only)");
+            return Ok(ExitCode::SUCCESS);
+        }
+        (true, Some((_, rules))) if rules.is_empty() => {
+            println!("firewall: no rules for enishi to remove");
+            return Ok(ExitCode::SUCCESS);
+        }
+        _ => {}
+    }
+    let installed = prefix.join(CLI_EXE);
+    let exe = if installed.exists() {
+        installed
     } else {
-        firewall_add(&args.name, &prefix)?;
-        println!(
-            "firewall rule {:?}: UDP in, Private profile only, for {} and {}",
-            args.name,
-            prefix.join(DAEMON_EXE).display(),
-            prefix.join(CLI_EXE).display()
-        );
+        std::env::current_exe().context("cannot locate the running enishi binary")?
+    };
+    println!("firewall: asking Windows for admin rights (UAC)…");
+    match elevate(&exe, &fw::helper_args(name, &prefix, args.remove)) {
+        Elevation::Done(0) => {
+            if args.remove {
+                println!("removed the firewall rules for enishi");
+            } else {
+                println!("firewall rule {name:?}: UDP in, Private profile only");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        other => {
+            eprintln!("enishi: firewall unchanged: {}", other.describe());
+            Ok(ExitCode::FAILURE)
+        }
     }
-    Ok(ExitCode::SUCCESS)
+}
+
+// ---------- elevation ----------
+
+#[derive(Debug)]
+enum Elevation {
+    /// The elevated helper ran; its exit code.
+    Done(u32),
+    /// The user said no to the UAC prompt.
+    Declined,
+    /// Nobody answered (or the helper hung) within ELEVATION_TIMEOUT.
+    TimedOut,
+    Failed(String),
+}
+
+impl Elevation {
+    fn describe(&self) -> String {
+        match self {
+            Elevation::Done(c) => format!("the elevated helper failed (exit {c})"),
+            Elevation::Declined => "UAC prompt declined".into(),
+            Elevation::TimedOut => format!(
+                "no answer to the UAC prompt within {} s",
+                ELEVATION_TIMEOUT.as_secs()
+            ),
+            Elevation::Failed(e) => format!("elevation failed: {e}"),
+        }
+    }
+}
+
+/// Run `exe args` elevated (`runas`: the UAC prompt), hidden, and wait for it. The prompt
+/// blocks `ShellExecuteExW`, so it runs on its own thread and is abandoned after
+/// ELEVATION_TIMEOUT (a late "yes" still runs the helper, which only sets the rules right).
+fn elevate(exe: &Path, args: &str) -> Elevation {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let exe = exe.to_path_buf();
+    let args = args.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("uac".into())
+        .spawn(move || {
+            let _ = tx.send(elevate_blocking(&exe, &args));
+        });
+    if let Err(e) = spawned {
+        return Elevation::Failed(e.to_string());
+    }
+    rx.recv_timeout(ELEVATION_TIMEOUT)
+        .unwrap_or(Elevation::TimedOut)
+}
+
+fn elevate_blocking(exe: &Path, args: &str) -> Elevation {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_OBJECT_0},
+        System::{
+            Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
+            Threading::{GetExitCodeProcess, WaitForSingleObject},
+        },
+        UI::{
+            Shell::{
+                SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+                ShellExecuteExW,
+            },
+            WindowsAndMessaging::SW_HIDE,
+        },
+    };
+    let verb = wide(OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params = wide(OsStr::new(args));
+    unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        );
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = params.as_ptr();
+        info.nShow = SW_HIDE;
+        if ShellExecuteExW(&mut info) == 0 {
+            let err = GetLastError();
+            return if err == ERROR_CANCELLED {
+                Elevation::Declined
+            } else {
+                Elevation::Failed(format!(
+                    "{} (error {err})",
+                    std::io::Error::from_raw_os_error(err as i32)
+                ))
+            };
+        }
+        if info.hProcess.is_null() {
+            return Elevation::Failed("no process handle".into());
+        }
+        let ms = ELEVATION_TIMEOUT.as_millis() as u32;
+        let r = if WaitForSingleObject(info.hProcess, ms) == WAIT_OBJECT_0 {
+            let mut code = 0u32;
+            if GetExitCodeProcess(info.hProcess, &mut code) != 0 {
+                Elevation::Done(code)
+            } else {
+                Elevation::Failed("cannot read the helper's exit code".into())
+            }
+        } else {
+            Elevation::TimedOut
+        };
+        CloseHandle(info.hProcess);
+        r
+    }
 }
 
 // ---------- Win32 helpers ----------

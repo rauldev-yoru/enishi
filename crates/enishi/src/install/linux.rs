@@ -1,13 +1,18 @@
-//! Linux: binary in `~/.local/bin`, `systemd --user` unit, linger hint.
+//! Linux: binary in `~/.local/bin`, `systemd --user` unit, linger hint, firewalld/ufw check.
 
 use std::{
+    io::{BufRead, IsTerminal, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result};
 
-use super::{Ctx, InstallArgs, Manifest, copy_atomic, render, run_cmd, same_file};
+use super::{
+    Ctx, InstallArgs, Manifest, copy_atomic,
+    firewall::{self, Detected, LinuxPlan, Tool},
+    render, run_cmd, same_file,
+};
 
 const MARKER: &str = "Written by `enishi install`";
 
@@ -133,6 +138,9 @@ fn linger_enabled() -> Option<bool> {
 }
 
 pub fn after_install(ctx: &Ctx, args: &InstallArgs, m: &Manifest) {
+    if !args.no_firewall {
+        firewall_step(ctx.listen_port);
+    }
     let user = std::env::var("USER").unwrap_or_else(|_| "$USER".into());
     match linger_enabled() {
         Some(true) => println!("linger: on (the daemon runs without an open session)"),
@@ -163,7 +171,152 @@ pub fn after_install(ctx: &Ctx, args: &InstallArgs, m: &Manifest) {
     );
 }
 
-pub fn uninstall(name: &str, m: Option<&Manifest>) -> Result<()> {
+/// Stdout of a probe command, if it ran and exited 0 (stderr discarded, stdin closed).
+fn probe(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn unit_active(unit: &str) -> bool {
+    probe("systemctl", &["is-active", "--quiet", unit]).is_some()
+}
+
+/// Find an active firewalld or ufw and whether `port`/udp is open where it applies. No
+/// sudo: firewalld answers queries unprivileged (`--state` may need polkit, so the unit
+/// state is the fallback); ufw lists rules only for root, so its answer may be unknown.
+fn detect(port: Option<u16>) -> Option<Detected> {
+    let firewalld = probe("firewall-cmd", &["--state"]).is_some_and(|s| s.trim() == "running")
+        || (unit_active("firewalld") && probe("firewall-cmd", &["--get-default-zone"]).is_some());
+    if firewalld {
+        // The zone of the default route's interface, else the default zone.
+        let dev = probe("ip", &["route", "show", "default"])
+            .and_then(|o| firewall::default_route_dev(&o));
+        let zone = dev
+            .and_then(|d| probe("firewall-cmd", &[&format!("--get-zone-of-interface={d}")]))
+            .or_else(|| probe("firewall-cmd", &["--get-default-zone"]))
+            .map(|z| z.trim().to_string())
+            .filter(|z| !z.is_empty());
+        let open = match (port, &zone) {
+            (Some(p), Some(z)) => {
+                let zone_arg = format!("--zone={z}");
+                let query = Command::new("firewall-cmd")
+                    .args([zone_arg.as_str(), &format!("--query-port={p}/udp")])
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok();
+                match query.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()) {
+                    Some(s) if s == "yes" => Some(true),
+                    // `--query-port` matches ranges; check the list too in case of an
+                    // older firewalld that does not.
+                    Some(s) if s == "no" => Some(
+                        probe("firewall-cmd", &[&zone_arg, "--list-ports"])
+                            .is_some_and(|l| firewall::ports_cover(&l, p, "udp")),
+                    ),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        return Some(Detected {
+            tool: Tool::Firewalld,
+            zone,
+            open,
+        });
+    }
+    let ufw_enabled = std::fs::read_to_string("/etc/ufw/ufw.conf").is_ok_and(|t| {
+        t.lines()
+            .any(|l| l.trim().eq_ignore_ascii_case("ENABLED=yes"))
+    });
+    let status = probe("ufw", &["status", "verbose"]);
+    let active = match &status {
+        Some(s) => firewall::ufw_port_open(s, 0).is_some(),
+        None => ufw_enabled && unit_active("ufw"),
+    };
+    if !active {
+        return None;
+    }
+    Some(Detected {
+        tool: Tool::Ufw,
+        zone: None,
+        open: match (&status, port) {
+            (Some(s), Some(p)) => firewall::ufw_port_open(s, p),
+            _ => None,
+        },
+    })
+}
+
+fn firewall_step(port: Option<u16>) {
+    let found = detect(port);
+    match firewall::linux_plan(found.as_ref(), port) {
+        LinuxPlan::NoFirewall => {}
+        LinuxPlan::NoListenPort(tool) => println!(
+            "firewall: {} is active and no [device] listen_port is set, so inbound can't be \
+             opened; links still work (outbound-initiated). Set listen_port to allow inbound.",
+            tool.label()
+        ),
+        LinuxPlan::AlreadyOpen { tool, zone, port } => println!(
+            "firewall: {} allows UDP {port}{}",
+            tool.label(),
+            zone.map(|z| format!(" (zone {z})")).unwrap_or_default()
+        ),
+        LinuxPlan::Open {
+            tool,
+            port,
+            known_closed,
+            cmds,
+        } => {
+            let line = firewall::shell_line(&cmds);
+            let state = if known_closed {
+                format!("{} blocks inbound UDP {port}", tool.label())
+            } else {
+                format!(
+                    "{} is active; could not read whether UDP {port} is open without root",
+                    tool.label()
+                )
+            };
+            if !std::io::stdin().is_terminal() {
+                println!(
+                    "firewall: {state}. Links still work outbound-initiated; to allow inbound run:\n  {line}"
+                );
+                return;
+            }
+            print!(
+                "firewall: {state}.\nOpen UDP {port} in {}? [y/N] ",
+                tool.label()
+            );
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut answer);
+            if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+                println!("firewall: left as is; to allow inbound later run:\n  {line}");
+                return;
+            }
+            for c in &cmds {
+                println!("+ {}", firewall::shell_line(std::slice::from_ref(c)));
+                // Interactive sudo: it may prompt for the password on this terminal.
+                let ok = Command::new(&c[0])
+                    .args(&c[1..])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !ok {
+                    eprintln!("enishi: that failed; run it yourself:\n  {line}");
+                    return;
+                }
+            }
+            println!("firewall: opened UDP {port} in {}", tool.label());
+        }
+    }
+}
+
+pub fn uninstall(name: &str, m: Option<&Manifest>, _no_firewall: bool) -> Result<()> {
     let unit_name = format!("{name}.service");
     let unit = match m.and_then(|m| m.unit.clone()) {
         Some(u) => u,
