@@ -1,0 +1,11 @@
+[package]
+name = "enishi-proto"
+description = "Wire types for enishi: frames, session headers, error codes (no I/O)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true

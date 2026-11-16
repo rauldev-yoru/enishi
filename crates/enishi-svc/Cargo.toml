@@ -1,0 +1,11 @@
+[package]
+name = "enishi-svc"
+description = "enishi service host: process spawn, exec, stdio services, PTY/ConPTY."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+

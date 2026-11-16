@@ -1,6 +1,6 @@
 # enishi — Design (v0.1 draft)
 
-Status: draft for review. Nothing here is implemented yet beyond the proof of concept
+Status: v0.1 design — decisions D1–D5 resolved (see §10). Nothing here is implemented yet beyond the proof of concept
 (`link-poc`), whose measured results are in the README.
 
 ## 1. Goal
@@ -50,15 +50,12 @@ Every command that targets a peer accepts a device, falling back to the configur
 default peer:
 
 ```
-enishi exec ls                      # default device
-enishi -d windows-home exec dir     # explicit device
-enishi @windows-home exec dir       # short form (same thing)
+enishi exec ls                          # default device
+enishi -d windows-home exec dir         # explicit device (-d / --device)
 ```
 
-> Why not `--windows-home` as a flag? Device names are user data, not part of the CLI
-> grammar: dynamic flags would clash with real flags (`--version`, `--help`, a device
-> named `status`…), break shell completion and make parsing ambiguous. `-d <name>` /
-> `@name` keeps the grammar fixed and still reads naturally. **Open decision (D1).**
+Device names are user data, not CLI grammar: `-d <name>` keeps the grammar fixed (no
+clashes with real flags, working shell completion). Decided in D1.
 
 ### 3.2 Commands
 
@@ -118,7 +115,6 @@ listen_port = 7801            # optional; fixed port helps direct dialing / fire
 [peers.windows-home]
 id = "0df46624…"              # filled by `enishi pair`
 addrs = ["100.71.180.5:7802"] # optional hints (Tailscale/LAN); discovery otherwise
-exec = true                   # may *I* be asked to exec by this peer? see [grants]
 
 # What this device publishes, and to whom
 [services.fs]
@@ -135,6 +131,20 @@ services = ["fs", "ps"]
 Rule: **everything is denied unless granted**, per peer. `exec` is the most powerful grant
 and is opt-in.
 
+`exec` is modelled as a policy, not a plain bool, so command allowlists can be added
+later without breaking configs (D5):
+
+```toml
+exec = true                                   # v0.1: allow all
+exec = false                                  # v0.1: deny (default)
+# later, same key:
+exec = { allow = ["git *", "Get-ChildItem *"], deny = ["Remove-Item *"] }
+```
+
+In code: `enum ExecPolicy { Deny, AllowAll, Rules(..) }` with every exec request going
+through one `authorize_exec(peer, request)` check, so adding `Rules` only touches that
+function.
+
 ## 5. Protocol (L2/L3)
 
 iroh connection per peer pair, kept warm by the daemon. ALPNs:
@@ -146,8 +156,8 @@ iroh connection per peer pair, kept warm by the daemon. ALPNs:
   `{ok}` or `{err, code, message}` (ack within a bounded timeout — PoC lesson), then raw
   stdio frames multiplexed as `{stdin|stdout|stderr|exit|signal}`.
 
-Framing: length-prefixed frames (CBOR or postcard) — **open decision (D3)**; the PoC used
-raw bytes + newline header.
+Framing: length-prefixed **postcard** frames (D3); the PoC used raw bytes + newline
+header.
 
 Presence (validated in PoC): heartbeat ~1.5 s, offline after a missed heartbeat, short
 capped backoff, and a **hello on resume** sent by the device that slept (detected via wall
@@ -204,10 +214,12 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | v0.3 | macOS, self-hosted relay, pre-logon presence service | third device |
 | later | Android, file/clipboard services, Windows UI/browser services on top | — |
 
-## 10. Open decisions
+## 10. Decisions
 
-- **D1** device selection syntax: `-d name` + `@name` (proposed) vs. dynamic `--name` flags.
-- **D2** exec default: through the platform shell (proposed) vs. raw process by default.
-- **D3** frame encoding: postcard vs. CBOR vs. JSON-lines.
-- **D4** project config format/location (TOML proposed).
-- **D5** whether `exec` grant is per-peer boolean (proposed) or command allowlists in v0.1.
+| | Decision |
+|---|---|
+| **D1** | Device selection with `-d <name>` / `--device <name>`; default peer from config. No `@name`, no dynamic flags. |
+| **D2** | `exec` runs through the platform shell by default (PowerShell on Windows, `$SHELL`/`sh` on Linux); `--raw` spawns the process directly. |
+| **D3** | Wire frames: length-prefixed postcard. |
+| **D4** | Config: TOML, `enishi.toml` per device. |
+| **D5** | `exec` grant is allow/deny per peer in v0.1, modelled as `ExecPolicy` so allowlists drop in later. |

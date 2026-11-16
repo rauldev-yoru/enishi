@@ -1,0 +1,12 @@
+[package]
+name = "enishi"
+description = "縁 — native P2P link between your devices: run commands and use stdio/MCP services across machines, sleep-aware."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
