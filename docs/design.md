@@ -1,7 +1,8 @@
 # enishi — Design (v0.1 draft)
 
-Status: v0.1 design — decisions D1–D5 resolved (see §10). Nothing here is implemented yet beyond the proof of concept
-(`link-poc`), whose measured results are in the README.
+Status: v0.1 design — decisions D1–D5 resolved (see §10). Implemented so far: config + identity
+(`enishi id`) and the daemon base (`enishi up`, presence, `enishi status`). The rest is
+design; the proof of concept (`link-poc`) measured results are in the README.
 
 ## 1. Goal
 
@@ -83,7 +84,8 @@ echo data | enishi exec -- wc -c                                  # stdin is str
 ```
 
 - Exit code of the remote process becomes `enishi`'s exit code; enishi's own errors use
-  reserved codes (e.g. `255 peer offline`, `254 not allowed`).
+  reserved codes (e.g. `255 peer offline`, `254 not allowed`, `253 no such service`,
+  `252 daemon not running`; `2` usage errors such as an unknown device).
 - `--timeout`, `--cwd`, `--env K=V`, `--shell <pwsh|powershell|cmd|bash|sh>`, `--raw`.
 - stdout and stderr are kept separate (two streams), unlike the PoC.
 
@@ -128,6 +130,12 @@ exec = true                   # run arbitrary commands (off by default)
 services = ["fs", "ps"]
 ```
 
+The config location can be overridden with the global `--config <path>` flag or the
+`ENISHI_CONFIG` environment variable; the key and the daemon's IPC endpoint then live next
+to that file, so several instances can run on one host (integration tests, multiple
+identities). `identity.key` (32 raw bytes) is created on first use (`enishi id` or
+`enishi up`); the daemon refuses a key readable by other users on unix.
+
 Rule: **everything is denied unless granted**, per peer. `exec` is the most powerful grant
 and is opt-in.
 
@@ -163,6 +171,21 @@ Presence (validated in PoC): heartbeat ~1.5 s, offline after a missed heartbeat,
 capped backoff, and a **hello on resume** sent by the device that slept (detected via wall
 clock jump) so reconnect takes seconds instead of a backoff cycle.
 
+`enishi/ctl/1` as implemented (v0.1 step 2): each daemon dials every configured peer and
+keeps its own warm connection, so a pair of devices holds one ctl connection per
+direction and each side measures presence independently. Every exchange is one
+request frame + one response frame on a fresh bi-stream: `Hello {device, version,
+instance, resume}` first, then `Ping {seq}` / `Pong {seq}` every 1.5 s (1.5 s timeout;
+rtt = ping round trip). Unknown ids are rejected right after the TLS handshake. A
+connection close from the peer marks it offline at once; a silent peer after one missed
+heartbeat. Retry backoff 250 ms doubling to 1.5 s. Receiving a hello: offline → skip the
+backoff; online but a different `instance` (peer restarted) → drop and redial; online with
+`resume = true` → probe with an immediate heartbeat. A daemon that sees its wall clock
+jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true`.
+
+The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
+per connection (`Status {device}` today).
+
 ## 6. Security
 
 - Identity = Ed25519 key (iroh EndpointId). The only thing that authenticates a peer.
@@ -187,7 +210,10 @@ clock jump) so reconnect takes seconds instead of a backoff cycle.
 
 **Linux**
 - `systemd --user` unit (+ `loginctl enable-linger` for headless servers).
-- Local IPC: Unix socket in `$XDG_RUNTIME_DIR/enishi.sock`. Windows: named pipe.
+- Local IPC: Unix socket (0600) in `$XDG_RUNTIME_DIR/enishi.sock`, falling back to the
+  config dir. Windows: named pipe `\\.\pipe\enishi-<user>` (remote clients rejected).
+  Instances started with a non-default `--config` use `<config dir>/enishi.sock` /
+  `\\.\pipe\enishi-<user>-<hash of config path>`.
 
 ## 8. Repository layout
 
