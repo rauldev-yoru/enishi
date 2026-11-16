@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::{ExecRequest, ServiceInfo};
+use crate::session::{ExecRequest, ServiceInfo, SessionKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcRequest {
@@ -31,6 +31,12 @@ pub enum IpcRequest {
     PairJoin { code: String, name: Option<String> },
     /// Re-read `enishi.toml` and apply peers/grants without a restart.
     Reload,
+    /// Open any session (`header`) on `device` (default peer when `None`); streams like
+    /// [`IpcRequest::Exec`]. Newer session kinds use this instead of a request each.
+    Open {
+        device: Option<String>,
+        header: SessionKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -74,6 +74,9 @@ pub struct ServiceConfig {
 pub struct Grant {
     #[serde(default)]
     pub exec: ExecPolicy,
+    /// Transparent MCP: start any MCP server command (`enishi mcp -d <dev> -- cmd…`).
+    #[serde(default)]
+    pub mcp: crate::policy::McpPolicy,
     #[serde(default)]
     pub services: Vec<String>,
 }

@@ -61,6 +61,11 @@ pub enum SessionKind {
         name: String,
         args: Vec<String>,
     },
+    /// Run `command` (argv, spawned directly: `shell`/`timeout_secs` are ignored) as an
+    /// MCP server for this session — `enishi mcp -d <dev> -- <command…>` ("transparent
+    /// mode"). The peer authorizes it with its `[grants.<peer>] mcp` policy; it never parses
+    /// the MCP traffic, which is plain stdio like any service.
+    Mcp(ExecRequest),
 }
 
 /// The peer's answer to a [`SessionKind`] header.
@@ -136,6 +141,11 @@ mod tests {
             name: "fs".into(),
             args: vec![],
         });
+        rt(SessionKind::Mcp(ExecRequest {
+            command: vec!["npx".into(), "-y".into(), "pkg".into()],
+            raw: true,
+            ..Default::default()
+        }));
         rt(ServiceInfo {
             name: "fs".into(),
             kind: ServiceKind::Mcp,

@@ -171,6 +171,8 @@ fn array_mut<'a>(table: &'a mut Table, key: &str, what: &str) -> Result<&'a mut 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GrantEdit {
     pub exec: Option<bool>,
+    /// Transparent MCP (`mcp = true|false`), see [`crate::policy::authorize_mcp`].
+    pub mcp: Option<bool>,
     /// Grant these services: added to `[grants.<peer>] services` **and** the peer added to
     /// each service's `allow` (both gates of D9 in one command).
     pub services: Vec<String>,
@@ -235,7 +237,7 @@ pub fn edit_grant(text: &str, peer: &str, edit: &GrantEdit) -> Result<(String, C
     let g = grants[peer]
         .as_table_mut()
         .with_context(|| format!("[grants.{peer}] must be a table"))?;
-    for (key, want) in [("exec", edit.exec)] {
+    for (key, want) in [("exec", edit.exec), ("mcp", edit.mcp)] {
         let Some(want) = want else { continue };
         let current = g.get(key).and_then(Item::as_bool);
         if current != Some(want) {
@@ -377,6 +379,7 @@ mod tests {
         let text = add_service(&base(), &spec("fs"), false).unwrap();
         let edit = GrantEdit {
             exec: Some(false),
+            mcp: Some(true),
             services: vec!["old".into(), "fs".into()],
             revoke: vec![],
         };
@@ -391,6 +394,11 @@ mod tests {
         assert!(changes.contains(&"[services.old] allow += lap".to_string()));
         assert!(!changes.iter().any(|c| c.contains("[services.fs] allow")));
         assert!(crate::policy::authorize_service(&cfg, "lap", "old", &[]).is_ok());
+        assert_eq!(g.mcp, ExecPolicy::Flag(true));
+        assert!(
+            changes.contains(&"[grants.lap] mcp = true".to_string()),
+            "{changes:?}"
+        );
 
         // Idempotent.
         let (again, none) = edit_grant(&out, "lap", &edit).unwrap();

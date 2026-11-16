@@ -434,6 +434,7 @@ impl Shared {
             IpcRequest::PairInvite { name, ttl_secs } => self.pair_invite(name, ttl_secs),
             IpcRequest::Exec { .. }
             | IpcRequest::Run { .. }
+            | IpcRequest::Open { .. }
             | IpcRequest::Services { .. }
             | IpcRequest::PairJoin { .. }
             | IpcRequest::Reload => IpcResponse::Error {
@@ -649,6 +650,7 @@ where
             };
             session::client(sh, stream, device, header).await
         }
+        IpcRequest::Open { device, header } => session::client(sh, stream, device, header).await,
         IpcRequest::Services { device } => {
             let resp = sh.list_services(device).await;
             wire::write_frame(&mut stream, &resp).await

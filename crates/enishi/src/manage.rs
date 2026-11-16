@@ -81,6 +81,11 @@ pub struct GrantArgs {
     pub exec: bool,
     #[arg(long)]
     pub no_exec: bool,
+    /// Let the peer start any MCP server command here (`enishi mcp -d <this> -- cmd…`)
+    #[arg(long, overrides_with = "no_mcp")]
+    pub mcp: bool,
+    #[arg(long)]
+    pub no_mcp: bool,
     /// Grant a service: added to the grant and the peer to the service's allow list
     #[arg(long = "service", value_name = "SERVICE")]
     pub services: Vec<String>,
@@ -318,6 +323,11 @@ pub async fn grant(paths: &Paths, args: GrantArgs) -> Result<ExitCode> {
             (_, true) => Some(false),
             _ => None,
         },
+        mcp: match (args.mcp, args.no_mcp) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         services: args.services,
         revoke: args.revoke,
     };
@@ -355,13 +365,15 @@ fn render_grant(cfg: &Config, peer: &str) -> String {
         })
         .map(String::as_str)
         .collect();
-    let exec = match &g.exec {
+    let show = |p: &ExecPolicy| match p {
         ExecPolicy::Flag(true) => "yes (any command)",
         ExecPolicy::Rules { .. } => "rules (not supported yet: denied)",
         _ => "no",
     };
     format!(
-        "peer {peer}\n  exec:     {exec}\n  services: {}\n",
+        "peer {peer}\n  exec:     {}\n  mcp:      {}\n  services: {}\n",
+        show(&g.exec),
+        show(&g.mcp),
         if services.is_empty() {
             "none".into()
         } else {

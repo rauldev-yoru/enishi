@@ -32,6 +32,32 @@ pub fn authorize_exec(policy: &ExecPolicy, _command: &[String]) -> Result<(), &'
     }
 }
 
+/// `mcp` grant for a peer: may it start arbitrary MCP server commands here with
+/// `enishi mcp -d <this device> -- <command…>` (transparent mode)? Same shape as
+/// [`ExecPolicy`] (`true`/`false` now, `{ allow = [...] }` command rules later), checked
+/// only by [`authorize_mcp`]. Independent of `exec` (design D16).
+pub type McpPolicy = ExecPolicy;
+
+/// The single check for transparent MCP sessions; the request is then spawned raw.
+pub fn authorize_mcp(policy: &McpPolicy, _command: &[String]) -> Result<(), &'static str> {
+    match policy {
+        ExecPolicy::Flag(true) => Ok(()),
+        ExecPolicy::Flag(false) | ExecPolicy::Deny => {
+            Err("mcp commands not granted to this peer (needs [grants.<peer>] mcp = true)")
+        }
+        ExecPolicy::Rules { .. } => Err("mcp rules are not supported yet"),
+    }
+}
+
+/// What actually runs for a transparent MCP session: the argv spawned directly, never a
+/// shell, never a timeout (the session lives as long as the client).
+pub fn mcp_command(mut req: ExecRequest) -> ExecRequest {
+    req.raw = true;
+    req.shell = None;
+    req.timeout_secs = None;
+    req
+}
+
 /// A refused session: `code` is [`exit::NO_SUCH_SERVICE`] or [`exit::NOT_ALLOWED`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
@@ -212,6 +238,33 @@ services = ["fs"]
         };
         assert_eq!(names("a"), vec!["fs", "wc"]);
         assert!(names("c").is_empty());
+    }
+
+    #[test]
+    fn mcp_grant_is_separate_from_exec() {
+        let c = cfg();
+        let argv = vec!["npx".to_string(), "-y".into(), "pkg".into()];
+        // b has exec = true but no mcp grant: denied (D16).
+        assert!(authorize_mcp(&c.grant("b").mcp, &argv).is_err());
+        assert!(authorize_mcp(&McpPolicy::Flag(true), &argv).is_ok());
+        assert!(authorize_mcp(&McpPolicy::Flag(false), &argv).is_err());
+        let rules = McpPolicy::Rules {
+            allow: vec!["npx *".into()],
+            deny: vec![],
+        };
+        assert!(authorize_mcp(&rules, &argv).is_err(), "rules fail closed");
+        let g: crate::config::Grant = toml::from_str("mcp = true").unwrap();
+        assert_eq!(g.mcp, McpPolicy::Flag(true));
+        assert_eq!(g.exec, ExecPolicy::Deny, "mcp does not imply exec");
+        let r = mcp_command(ExecRequest {
+            command: argv.clone(),
+            shell: Some("bash".into()),
+            raw: false,
+            timeout_secs: Some(3),
+            ..Default::default()
+        });
+        assert!(r.raw && r.shell.is_none() && r.timeout_secs.is_none());
+        assert_eq!(r.command, argv);
     }
 
     #[test]

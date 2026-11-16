@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 use crate::{
     audit::{Direction, Entry},
     daemon::{Peer, Shared},
-    policy::{authorize_exec, authorize_service, service_command},
+    policy::{authorize_exec, authorize_mcp, authorize_service, mcp_command, service_command},
     wire,
 };
 
@@ -58,6 +58,7 @@ fn describe(h: &SessionKind) -> (&'static str, String) {
         SessionKind::Exec(r) => ("exec", show(&r.command)),
         SessionKind::Service { name, args } if args.is_empty() => ("service", name.clone()),
         SessionKind::Service { name, args } => ("service", format!("{name} {}", show(args))),
+        SessionKind::Mcp(r) => ("mcp", show(&r.command)),
     }
 }
 
@@ -65,6 +66,7 @@ fn entry<'a>(dir: Direction, peer: &'a str, h: &'a SessionKind) -> Entry<'a> {
     match h {
         SessionKind::Exec(r) => Entry::exec(dir, peer, r),
         SessionKind::Service { name, args } => Entry::service(dir, peer, name, args),
+        SessionKind::Mcp(r) => Entry::mcp(dir, peer, r),
     }
 }
 
@@ -276,15 +278,16 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     let t0 = Instant::now();
     let (word, what) = describe(&header);
     // Services: authorize, then the service's argv (no shell) is the process to spawn.
-    let (req, service) = match header {
-        SessionKind::Exec(r) => (r, None),
+    let (req, service, mcp) = match header {
+        SessionKind::Exec(r) => (r, None, false),
+        SessionKind::Mcp(r) => (mcp_command(r), None, true),
         SessionKind::Service { name, args } => {
             let planned = {
                 let cfg = sh.cfg();
                 authorize_service(&cfg, &peer.name, &name, &args).map(|s| service_command(s, &args))
             };
             match planned {
-                Ok(req) => (req, Some(name)),
+                Ok(req) => (req, Some(name), false),
                 Err(r) => {
                     warn!(peer = %peer.name, code = r.code, "service `{what}` refused: {}", r.message);
                     sh.audit.record(
@@ -303,14 +306,20 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     let audit = |exit: Option<i32>, error: Option<&str>| {
         let e = match &service {
             Some(name) => Entry::service(Direction::In, &peer.name, name, &req.command),
+            None if mcp => Entry::mcp(Direction::In, &peer.name, &req),
             None => Entry::exec(Direction::In, &peer.name, &req),
         };
         sh.audit.record(&e.finish(exit, error, t0.elapsed()));
     };
     if service.is_none() {
-        let policy = sh.grant(&peer.name).exec;
-        if let Err(why) = authorize_exec(&policy, &req.command) {
-            warn!(peer = %peer.name, "exec denied `{what}`: {why}");
+        let grant = sh.grant(&peer.name);
+        let verdict = if mcp {
+            authorize_mcp(&grant.mcp, &req.command)
+        } else {
+            authorize_exec(&grant.exec, &req.command)
+        };
+        if let Err(why) = verdict {
+            warn!(peer = %peer.name, "{word} denied `{what}`: {why}");
             audit(None, Some(why));
             let _ = refuse(&mut send, exit::NOT_ALLOWED, why.into()).await;
             return;

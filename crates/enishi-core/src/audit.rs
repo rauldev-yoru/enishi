@@ -34,6 +34,9 @@ pub struct Entry<'a> {
     /// publishing side, the extra args on the calling side).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<&'a str>,
+    /// Transparent MCP session (`enishi mcp -d dev -- cmd…`): `cmd` is the server argv.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mcp: bool,
     pub cmd: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<&'a str>,
@@ -58,6 +61,7 @@ impl<'a> Entry<'a> {
             dir,
             peer,
             service: None,
+            mcp: false,
             cmd: &req.command,
             shell: req.shell.as_deref(),
             raw: req.raw,
@@ -69,12 +73,20 @@ impl<'a> Entry<'a> {
         }
     }
 
+    pub fn mcp(dir: Direction, peer: &'a str, req: &'a ExecRequest) -> Entry<'a> {
+        Entry {
+            mcp: true,
+            ..Entry::exec(dir, peer, req)
+        }
+    }
+
     pub fn service(dir: Direction, peer: &'a str, name: &'a str, cmd: &'a [String]) -> Entry<'a> {
         Entry {
             ts: rfc3339(SystemTime::now()),
             dir,
             peer,
             service: Some(name),
+            mcp: false,
             cmd,
             shell: None,
             raw: true,
