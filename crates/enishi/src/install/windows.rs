@@ -891,3 +891,224 @@ fn path_remove(dir: &Path) -> Result<bool> {
     write_user_path(&new, ty)?;
     Ok(true)
 }
+
+/// Is this process a descendant of the installed daemon (`enishiw.exe`), e.g. an `exec`
+/// child? Ending the logon task kills its whole job, so such a process cannot replace the
+/// daemon and live to start it again (bug #11).
+pub fn inside_daemon(m: &Manifest) -> bool {
+    let Some(daemon) = &m.daemon_bin else {
+        return false;
+    };
+    let want = daemon.to_string_lossy().to_lowercase();
+    ancestors().iter().any(|exe| exe.to_lowercase() == want)
+}
+
+/// Image paths of this process's ancestors (nearest first, up to 32).
+fn ancestors() -> Vec<String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+    };
+    let mut parent = std::collections::HashMap::new();
+    // SAFETY: snapshot handle checked and closed; entry sized as required.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut e) != 0;
+        while more {
+            parent.insert(e.th32ProcessID, e.th32ParentProcessID);
+            more = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    let mut out = Vec::new();
+    let mut pid = std::process::id();
+    for _ in 0..32 {
+        let Some(&pp) = parent.get(&pid) else { break };
+        if pp == 0 || pp == pid {
+            break;
+        }
+        // SAFETY: handle checked and closed; buffer length passed in/out.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pp);
+            if h.is_null() {
+                break;
+            }
+            let mut buf = [0u16; 1024];
+            let mut n = buf.len() as u32;
+            if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) != 0 {
+                out.push(String::from_utf16_lossy(&buf[..n as usize]));
+            }
+            CloseHandle(h);
+        }
+        pid = pp;
+    }
+    out
+}
+
+pub fn stop(m: &Manifest) -> Result<String> {
+    let ended = schtasks(&["/End", "/TN", &m.name]).is_ok();
+    let killed = m.daemon_bin.as_deref().map(kill_by_path).unwrap_or(0);
+    Ok(format!(
+        "schtasks /End /TN {}{}; {killed} daemon process(es) terminated",
+        m.name,
+        if ended { "" } else { " (not running)" }
+    ))
+}
+
+pub fn start(m: &Manifest) -> Result<String> {
+    schtasks(&["/Run", "/TN", &m.name]).context("starting the task")?;
+    Ok(format!("schtasks /Run /TN {}", m.name))
+}
+
+/// Write an installed binary (a running one is moved aside first).
+pub fn put(bytes: &[u8], dst: &Path) -> Result<()> {
+    place(bytes, dst)
+}
+
+/// Point stdout/stderr of this (windowless) updater at the log, so the install steps it
+/// reuses leave their output there.
+pub fn redirect_stdio(log: &Path) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        let h = f.as_raw_handle();
+        // SAFETY: the handle stays valid for the life of the process (leaked below).
+        unsafe {
+            SetStdHandle(STD_OUTPUT_HANDLE, h as _);
+            SetStdHandle(STD_ERROR_HANDLE, h as _);
+        }
+        std::mem::forget(f);
+    }
+}
+
+fn in_job(process: windows_sys::Win32::Foundation::HANDLE) -> Option<bool> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    let mut b = 0;
+    // SAFETY: valid process handle; null job = "any job".
+    (unsafe { IsProcessInJob(process, std::ptr::null_mut(), &mut b) } != 0).then_some(b != 0)
+}
+
+pub fn diagnostics() -> String {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: pseudo handle of this process.
+    let job = in_job(unsafe { GetCurrentProcess() });
+    format!(
+        "in a job object: {}",
+        match job {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
+    )
+}
+
+pub fn delete_task(name: &str) {
+    let _ = schtasks(&["/Delete", "/TN", name, "/F"]);
+}
+
+/// Start `exe args` outside the daemon's lifetime: broken away from every job object
+/// (suspended first, to check it really left them all), else via a one-shot scheduled
+/// task that deletes itself.
+pub fn spawn_detached(exe: &Path, args: &[String], _log: &Path, unit: &str) -> Result<String> {
+    let why = match spawn_breakaway(exe, args) {
+        Ok(()) => return Ok("process broken away from the daemon's job objects".into()),
+        Err(e) => format!("{e:#}"),
+    };
+    let mut a: Vec<String> = args.to_vec();
+    a.extend(["--task".into(), unit.into()]);
+    let line = a
+        .iter()
+        .map(|s| render::win_arg(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let workdir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    let xml = render::update_task_xml(&current_user(), exe, &line, &workdir);
+    let tmp = std::env::temp_dir().join(format!("enishi-update-{}.xml", std::process::id()));
+    std::fs::write(&tmp, render::utf16le_bom(&xml))?;
+    let created = schtasks(&["/Create", "/TN", unit, "/XML", &tmp.to_string_lossy(), "/F"]);
+    let _ = std::fs::remove_file(&tmp);
+    created.context("registering the one-shot updater task")?;
+    if let Err(e) = schtasks(&["/Run", "/TN", unit]) {
+        delete_task(unit);
+        return Err(e.context("starting the one-shot updater task"));
+    }
+    Ok(format!("one-shot task {unit:?} (breakaway failed: {why})"))
+}
+
+fn spawn_breakaway(exe: &Path, args: &[String]) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+            DETACHED_PROCESS, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, TerminateProcess,
+        },
+    };
+    let mut line: Vec<u16> = std::iter::once(render::win_arg(&exe.to_string_lossy()))
+        .chain(args.iter().map(|a| render::win_arg(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let app = wide(exe.as_os_str());
+    let cwd = exe.parent().map(|d| wide(d.as_os_str()));
+    let flags = CREATE_BREAKAWAY_FROM_JOB
+        | DETACHED_PROCESS
+        | CREATE_NEW_PROCESS_GROUP
+        | CREATE_NO_WINDOW
+        | CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT;
+    // SAFETY: valid NUL-terminated buffers; handles from CreateProcessW are closed.
+    unsafe {
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessW(
+            app.as_ptr(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            flags,
+            std::ptr::null(),
+            cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            &si,
+            &mut pi,
+        );
+        if ok == 0 {
+            bail!(
+                "CreateProcess with CREATE_BREAKAWAY_FROM_JOB: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let still = in_job(pi.hProcess);
+        if still != Some(false) {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            bail!("the new process is still in a job object (a parent job forbids breakaway)");
+        }
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    Ok(())
+}

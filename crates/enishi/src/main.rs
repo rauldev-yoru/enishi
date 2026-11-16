@@ -55,6 +55,9 @@ enum Cmd {
     },
     /// Install for this user: binary, autostart (systemd user unit / logon task), start it
     Install(install::InstallArgs),
+    /// Update the installed enishi (newest release, --version, or --from-file); with
+    /// -d <device>, update that device (needs its `update` grant)
+    Update(Box<install::update::UpdateArgs>),
     /// Reverse `enishi install` (--purge --yes also deletes config, identity and cache)
     Uninstall(install::UninstallArgs),
     /// Windows: add (or --remove, --check) the Private-only firewall rule (asks for UAC once)
@@ -179,7 +182,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             logging::init(log_file.as_deref())?;
             let cfg = Config::load(&paths.config_file)?;
             let key = identity::load_or_create(&paths.identity_key())?;
-            enishi_core::daemon::run(cfg, paths, key).await?;
+            let hook_paths = paths.clone();
+            let hooks = enishi_core::daemon::Hooks {
+                update: Some(std::sync::Arc::new(move |order| {
+                    install::update::spawn_for_peer(&hook_paths, order)
+                })),
+            };
+            enishi_core::daemon::run_with(cfg, paths, key, hooks).await?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Id => {
@@ -237,6 +246,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Grant(args) => manage::grant(&paths, args).await,
         Cmd::Logs { follow, lines } => logging::show(&paths.log_file(), lines, follow),
         Cmd::Install(args) => install::install(&paths, args).await,
+        Cmd::Update(args) => install::update::run(&paths, cli.device, *args).await,
         Cmd::Uninstall(args) => install::uninstall(&paths, args).await,
         Cmd::Firewall(args) => install::firewall(args),
     }

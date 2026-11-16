@@ -362,6 +362,106 @@ pub fn uninstall(name: &str, m: Option<&Manifest>, _no_firewall: bool) -> Result
     Ok(())
 }
 
+/// Is this process inside the installed daemon's unit (an `exec` child)? `systemctl stop`
+/// kills every process of the unit's cgroup, so such a process cannot restart the daemon
+/// and live to see it (bug #11).
+pub fn inside_daemon(m: &Manifest) -> bool {
+    let unit = format!("/{}.service", m.name);
+    std::fs::read_to_string("/proc/self/cgroup").is_ok_and(|t| {
+        t.lines()
+            .any(|l| l.ends_with(&unit) || l.contains(&format!("{unit}/")))
+    })
+}
+
+pub fn stop(m: &Manifest) -> Result<String> {
+    let unit = format!("{}.service", m.name);
+    systemctl(&["stop", &unit])?;
+    Ok(format!("systemctl --user stop {unit}"))
+}
+
+pub fn start(m: &Manifest) -> Result<String> {
+    let unit = format!("{}.service", m.name);
+    systemctl(&["start", &unit])?;
+    Ok(format!("systemctl --user start {unit}"))
+}
+
+/// Write an installed binary (rename over: fine while it runs).
+pub fn put(bytes: &[u8], dst: &Path) -> Result<()> {
+    copy_atomic(bytes, dst)
+}
+
+/// Linux stage 2 writes through its stdout/stderr, already pointed at the log.
+pub fn redirect_stdio(_log: &Path) {}
+
+pub fn diagnostics() -> String {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    format!("cgroup {}", cg.trim())
+}
+
+pub fn delete_task(_name: &str) {}
+
+/// Start `exe args` outside the caller's (and so the daemon's) cgroup: a transient
+/// `systemd-run --user` service; without it, a new session via `setsid -f` (which escapes
+/// the process group but not the cgroup — enough when the caller is not in the unit).
+pub fn spawn_detached(exe: &Path, args: &[String], log: &Path, unit: &str) -> Result<String> {
+    let mut cmd = Command::new("systemd-run");
+    cmd.args(["--user", "--collect", "--quiet"])
+        .arg(format!("--unit={unit}"))
+        .arg(format!(
+            "--property=StandardOutput=append:{}",
+            log.display()
+        ))
+        .arg(format!("--property=StandardError=append:{}", log.display()));
+    // The user manager's environment may lack what located the install.
+    for k in [
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+        "PATH",
+    ] {
+        if let Some(v) = std::env::var_os(k).filter(|v| !v.is_empty()) {
+            let mut kv = std::ffi::OsString::from(format!("--setenv={k}="));
+            kv.push(v);
+            cmd.arg(kv);
+        }
+    }
+    cmd.arg("--")
+        .arg(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null());
+    let why = match cmd.output() {
+        Ok(o) if o.status.success() => {
+            return Ok(format!("systemd-run --user unit {unit}.service"));
+        }
+        Ok(o) => format!(
+            "systemd-run failed ({}): {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("systemd-run unavailable: {e}"),
+    };
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    let err = out.try_clone()?;
+    Command::new("setsid")
+        .arg("-f")
+        .arg(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .status()
+        .context("setsid -f")?
+        .success()
+        .then_some(())
+        .context("setsid -f failed")?;
+    Ok(format!("setsid -f ({why})"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

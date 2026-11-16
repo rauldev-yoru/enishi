@@ -14,8 +14,12 @@ use enishi_core::{ipc, paths::Paths};
 use enishi_proto::ipc::{IpcRequest, IpcResponse, StatusReport};
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_os = "linux", windows))]
+pub mod fetch;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", windows))]
+pub mod update;
 // Pure generators and decisions for every platform (tested everywhere); each OS uses its
 // half.
 #[allow(dead_code)]
@@ -217,6 +221,14 @@ pub async fn install(paths: &Paths, args: InstallArgs) -> Result<ExitCode> {
             listen_port,
         };
         let previous = Manifest::load(&args.name)?;
+        // From inside the installed daemon (an `exec` child) stopping it would kill this
+        // process mid-way (bug #11): hand over to the detached updater.
+        if let Some(prev) = &previous
+            && !args.no_start
+            && platform::inside_daemon(prev)
+        {
+            return update::install_detached(paths, &args, prev).await;
+        }
         let mut m = platform::install(&ctx, &args, previous.as_ref())?;
         m.created_config = created_config || previous.is_some_and(|p| p.created_config);
         let mf = m.save()?;
@@ -226,6 +238,9 @@ pub async fn install(paths: &Paths, args: InstallArgs) -> Result<ExitCode> {
             ok = wait_for_daemon(paths, &args.name).await;
         }
         platform::after_install(&ctx, &args, &m);
+        println!(
+            "update later: enishi update (from a paired device: enishi -d <this> update, once allowed here with `enishi grant <peer> --update`)"
+        );
         Ok(if ok {
             ExitCode::SUCCESS
         } else {
@@ -261,6 +276,8 @@ pub async fn uninstall(paths: &Paths, args: UninstallArgs) -> Result<ExitCode> {
         }
         platform::uninstall(&args.name, m.as_ref(), args.no_firewall)?;
         Manifest::remove(&args.name)?;
+        #[cfg(any(target_os = "linux", windows))]
+        update::remove_staging(&args.name);
         if args.purge {
             for d in purge_targets(paths, m.as_ref()) {
                 match std::fs::remove_dir_all(&d) {

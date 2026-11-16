@@ -186,6 +186,55 @@ pub fn task_xml(name: &str, user: &str, command: &Path, args: &str, workdir: &Pa
     )
 }
 
+/// One-shot task for the detached updater (Windows fallback when the updater cannot break
+/// away from the daemon's job): no trigger (started with `schtasks /Run`), interactive
+/// token, 30 min limit; the updater deletes it when done.
+pub fn update_task_xml(user: &str, command: &Path, args: &str, workdir: &Path) -> String {
+    let user = xml_escape(user);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>enishi one-shot updater. Written by `enishi update`; deletes itself.</Description>
+  </RegistrationInfo>
+  <Triggers />
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{args}</Arguments>
+      <WorkingDirectory>{workdir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        command = xml_escape(&command.to_string_lossy()),
+        args = xml_escape(args),
+        workdir = xml_escape(&workdir.to_string_lossy()),
+    )
+}
+
 /// UTF-16LE with BOM, as `schtasks /Create /XML` expects for `encoding="UTF-16"`.
 pub fn utf16le_bom(s: &str) -> Vec<u8> {
     let mut out = vec![0xFF, 0xFE];
@@ -258,6 +307,24 @@ pub fn elevated_firewall_remove_cmd(rule: &str, programs: &[&Path]) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn update_task_is_one_shot() {
+        let x = update_task_xml(
+            r"PC\raul",
+            Path::new(r"C:\Users\raul\AppData\Local\enishi\update\enishi\enishi-updater.exe"),
+            r#"update --stage2 --name enishi --from-file "C:\a b\enishi-new.exe""#,
+            Path::new(r"C:\Users\raul"),
+        );
+        assert!(x.contains("<Triggers />"), "no trigger: started by /Run");
+        assert!(x.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(x.contains("<ExecutionTimeLimit>PT30M</ExecutionTimeLimit>"));
+        assert!(
+            x.contains("--from-file &quot;C:\\a b\\enishi-new.exe&quot;"),
+            "{x}"
+        );
+        assert!(!x.contains("RestartOnFailure"));
+    }
 
     #[test]
     fn unit_quotes_and_pins_config() {
