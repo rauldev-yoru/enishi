@@ -65,6 +65,7 @@ clashes with real flags, working shell completion). Decided in D1.
 | `enishi up` | Run the daemon (foreground; installers wrap it as a service / logon task). |
 | `enishi id` | Print this device's public id. |
 | `enishi pair invite` / `enishi pair join <code>` | One-time pairing (see §6). |
+| `enishi reload` | Re-read `enishi.toml` into the running daemon (peers, grants, services). |
 | `enishi status [-d dev]` | Peers, presence (`online`, `asleep/offline`, last seen), latency. |
 | `enishi exec [-d dev] [opts] -- <cmd> [args…]` | Run a native command on the peer; stdin/stdout/stderr streamed, exit code propagated. |
 | `enishi shell [-d dev]` | Interactive shell on the peer (PTY / ConPTY). v0.2. |
@@ -189,6 +190,7 @@ iroh connection per peer pair, kept warm by the daemon. ALPNs:
 
 - `enishi/ctl/1` — control: hello (device name, version, capabilities, service catalog
   hash), heartbeat, presence, catalog fetch, wake hints.
+- `enishi/pair/1` — one-time pairing (§6.1); the only ALPN unknown devices may use.
 - `enishi/stream/1` — one QUIC bidirectional stream per session. A session starts with a
   small header frame `{kind: exec|service, target, args, cwd, env, pty}`, the peer answers
   `{ok}` or `{err, code, message}` (ack within a bounded timeout — PoC lesson), then raw
@@ -232,7 +234,7 @@ backoff; online but a different `instance` (peer restarted) → drop and redial;
 jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true`.
 
 The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
-per connection (`Status {device}`), except `Exec {device, request}`: the daemon answers
+per connection (`Status {device}`, `PairInvite`, `PairJoin`, `Reload`), except `Exec {device, request}`: the daemon answers
 `ExecStarted` (or `Error {code, message}`) and the connection then carries the same
 `ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
 after stdin EOF; closing it means "caller gone".
@@ -242,6 +244,7 @@ after stdin EOF; closing it means "caller gone".
 - Identity = Ed25519 key (iroh EndpointId). The only thing that authenticates a peer.
 - Pairing: `enishi pair invite` prints a one-time code (id + secret, expires in minutes);
   the other side runs `enishi pair join <code>`; both store each other's id. No code reuse.
+  Details in §6.1.
 - Default deny; grants per peer (§4). Unknown ids are dropped during the handshake.
 - No listening HTTP, no exposed debug ports. UDP only for QUIC.
 - Audit log (JSONL) of every exec/service session: who, what, when, exit code.
@@ -251,6 +254,62 @@ after stdin EOF; closing it means "caller gone".
 - "Rejected unknown peer" warnings are rate-limited to one per peer id per minute.
 - Relays: default public iroh relays only carry encrypted traffic; self-hosted relay
   supported for full independence (later).
+
+### 6.1 Pairing as implemented (v0.1 step 4)
+
+Pairing goes through the daemons on both sides (`252` if the local one is down).
+
+```
+A$ enishi pair invite [--name <A's name for B>] [--ttl 10m]
+enishi1-…                                      # the code, on stdout alone
+B$ enishi pair join enishi1-… [--name <B's name for A>]
+paired with "server" as peer "server" (a1b2c3d4e5); exec and services stay denied …
+```
+
+- **Invite** (`IpcRequest::PairInvite`): the daemon draws a 16-byte secret (OS RNG) and
+  keeps `{secret, name?, expires}` in memory only — a daemon restart drops open invites.
+  TTL defaults to 10 min (`--ttl` accepts `90s`, `10m`, `1h` or plain seconds; max 24 h). More
+  than one invite may be open; `--name` already taken (or invalid) is refused up front.
+- **Code**: `enishi1-` + lowercase RFC 4648 base32 (no padding) of postcard
+  `InviteCode {id: [u8; 32], secret: [u8; 16], device, addrs: Vec<SocketAddr>}` followed
+  by a 4-byte FNV-1a checksum (catches truncated / mistyped pastes; integrity is not
+  security — the secret and TLS are). `addrs` are A's current direct addresses as dial
+  hints, best first: Tailscale/CGNAT v4, 192.168/16, 10/8, other v4, Tailscale v6,
+  other v6; loopback/link-local/unspecified/multicast dropped, container bridges
+  (172.16/12) only when nothing better exists, max 8. Decoding is case-insensitive and
+  ignores whitespace. Typically ~150–250 characters.
+- **Handshake** (`enishi/pair/1`): B's daemon dials A with the code's id + addrs (iroh
+  discovery/relay fill in otherwise) and opens one bi-stream: `PairRequest {secret,
+  device, addrs}` → `PairResponse::Ok {device, addrs}` | `Err {message}`, within 10 s.
+  B's id is taken from TLS, never from the message. A's handshake hook lets unknown ids
+  in on this ALPN only while it has an unexpired invite out (`no pending invite`
+  otherwise); every other ALPN still rejects unknown ids.
+- **Checks on A**: secret compared in constant time against every open invite; expired
+  → `invite expired`; already consumed → `invite already used`; unknown → `invalid
+  invite`. The invite is consumed only when A has stored B (a refused join, e.g. name
+  collision, leaves it usable). Used/expired invites are remembered for 1 h after expiry to give
+  those specific errors. An id that is already a peer is refused (`already paired as
+  <name>`). B refuses locally before dialing when its name for A is taken / A is
+  already a peer, and when the code is its own.
+- **Names**: each side names the other after the other's `[device] name`, sanitized to
+  `[A-Za-z0-9._-]` (anything else → `-`), unless `--name` is given (invite → A's name for B,
+  join → B's name for A). A collision is an error naming `--name` as the way out.
+- **Stored**: each side appends `[peers.<name>] id = …` (+ `addrs` = the other side's
+  stable hints, only when it has a fixed `listen_port`, and only addresses on that port)
+  to **its own** `enishi.toml` with `toml_edit`, so comments and layout are kept; if
+  `[device] default_peer` is unset it is set to the new peer. Grants are not written:
+  the new peer can do nothing until `[grants.<name>]` is added (the CLI prints how).
+  Then the daemon applies the file live (below) — the peer goes online in seconds.
+  B writes its file only after A answered Ok; if B then fails to write, A has B and B
+  has not (re-pair after removing B from A).
+
+**Reload** (`enishi reload`, `IpcRequest::Reload`): re-reads `enishi.toml`; on a parse
+error the running config is kept. Peers added are dialed, removed/changed ones have
+their links closed (and changed ones re-dialed), the handshake allow-list is updated;
+grants and services are read per session, so they apply to new sessions (running
+sessions keep going). `[device] name` / `listen_port` changes are reported as needing a
+restart. There is no file watcher: edit, then `enishi reload`. Pairing uses the same
+path, so it also picks up pending manual edits.
 
 ## 7. Platform specifics
 
@@ -306,3 +365,4 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | **D5** | `exec` grant is allow/deny per peer in v0.1, modelled as `ExecPolicy` so allowlists drop in later. `Rules {allow, deny}` parses but is denied until enforced (fail closed). |
 | **D6** | Sessions use a dedicated warm `enishi/stream/1` connection next to the ctl one (not extra streams on ctl), so bulk stdio (own congestion window) cannot delay heartbeats into false offlines, while presence still owns the link lifecycle. |
 | **D7** | Exec authorization, spawn and ack happen before any stdio flows; a spawn failure is an ack error (`126`/`127`), never a half-open session. |
+| **D8** | Pairing is daemon-to-daemon on its own ALPN `enishi/pair/1` with a one-time, TTL-bound, in-memory invite; it adds the peer to each side's config with no grants and hot-applies it. Config edits are applied with an explicit `enishi reload` (no file watcher). |

@@ -9,12 +9,15 @@
 //!
 //! Next to each ctl connection the daemon keeps a warm `enishi/stream/1` connection to the
 //! same peer, on which exec sessions are opened (see [`crate::session`]).
+//!
+//! The peer set is live: pairing (`enishi/pair/1`, see [`crate::pairing`]) and
+//! `enishi reload` add, replace and retire peers without a restart.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -22,25 +25,27 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use enishi_proto::{
-    ALPN_CTL, ALPN_STREAM,
+    ALPN_CTL, ALPN_PAIR, ALPN_STREAM,
     ctl::{CtlRequest, CtlResponse, Hello},
     exit,
-    ipc::{IpcRequest, IpcResponse, PeerStatus, Presence, StatusReport},
+    ipc::{IpcRequest, IpcResponse, PeerStatus, Presence, ReloadReport, StatusReport},
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
-    endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, presets},
+    endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, Side, presets},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::Notify,
+    sync::{Notify, watch},
 };
 use tracing::{debug, info, warn};
 
 use crate::{
     audit::{AUDIT_FILE, Audit},
-    config::{Config, Grant},
+    config::{Config, Grant, PeerConfig},
     ipc,
+    pair::{InviteBook, hint_addrs},
+    pairing,
     paths::Paths,
     session, wire,
 };
@@ -57,8 +62,10 @@ const SERVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// "rejected unknown peer" is logged at most once per peer per this interval.
 const REJECT_LOG_EVERY: Duration = Duration::from_secs(60);
 
-const CLOSE_REJECTED: u32 = 1;
+pub(crate) const CLOSE_REJECTED: u32 = 1;
 const CLOSE_RESET: u32 = 2;
+/// The peer was removed from the config (reload) or replaced.
+const CLOSE_REMOVED: u32 = 3;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) struct PeerState {
@@ -77,7 +84,8 @@ pub(crate) struct PeerState {
 
 pub(crate) struct Peer {
     pub(crate) name: String,
-    id: EndpointId,
+    pub(crate) id: EndpointId,
+    addrs: Vec<SocketAddr>,
     addr: EndpointAddr,
     state: Mutex<PeerState>,
     /// Wakes the supervisor: skips the backoff when offline; when online, probes the link
@@ -85,9 +93,52 @@ pub(crate) struct Peer {
     wake: Notify,
     /// Send `resume = true` in the next hello.
     resume: AtomicBool,
+    /// `true` once the peer left the config: its supervisor exits and every connection
+    /// with it (ours and the ones it opened to us) is closed.
+    retired: watch::Sender<bool>,
 }
 
 impl Peer {
+    fn new(name: &str, cfg: &PeerConfig) -> Peer {
+        let mut addr = EndpointAddr::new(cfg.id);
+        for a in &cfg.addrs {
+            addr = addr.with_ip_addr(*a);
+        }
+        Peer {
+            name: name.to_string(),
+            id: cfg.id,
+            addrs: cfg.addrs.clone(),
+            addr,
+            state: Mutex::new(PeerState {
+                presence: Presence::Offline,
+                since: Instant::now(),
+                last_seen: None,
+                rtt: None,
+                last_error: None,
+                remote_instance: None,
+                force_reset: false,
+                stream: None,
+            }),
+            wake: Notify::new(),
+            resume: AtomicBool::new(false),
+            retired: watch::Sender::new(false),
+        }
+    }
+
+    fn retire(&self) {
+        self.retired.send_replace(true);
+    }
+
+    fn is_retired(&self) -> bool {
+        *self.retired.borrow()
+    }
+
+    /// Resolves once the peer is retired.
+    async fn until_retired(&self) {
+        let mut rx = self.retired.subscribe();
+        let _ = rx.wait_for(|r| *r).await;
+    }
+
     pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, PeerState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -144,29 +195,151 @@ impl Peer {
 }
 
 pub(crate) struct Shared {
-    device: String,
-    id: EndpointId,
+    pub(crate) device: String,
+    pub(crate) id: EndpointId,
     instance: u64,
-    peers: Vec<Arc<Peer>>,
-    by_id: HashMap<EndpointId, Arc<Peer>>,
-    cfg: Config,
+    listen_port: Option<u16>,
+    pub(crate) ep: Endpoint,
+    pub(crate) paths: Paths,
+    /// Sorted by name. Replaced as a whole by [`Shared::apply_config`].
+    peers: RwLock<Vec<Arc<Peer>>>,
+    pub(crate) cfg: RwLock<Config>,
+    pub(crate) gate: Arc<Gate>,
+    /// Serializes edits of the config file and of the peer set (pairing, reload).
+    pub(crate) cfg_edit: tokio::sync::Mutex<()>,
     pub(crate) audit: Audit,
 }
 
 impl Shared {
     /// Grant for `peer`; absent = deny everything.
     pub(crate) fn grant(&self, peer: &str) -> Grant {
-        self.cfg.grant(peer)
+        self.cfg().grant(peer)
+    }
+
+    pub(crate) fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Snapshot of the current peers.
+    pub(crate) fn peers(&self) -> Vec<Arc<Peer>> {
+        self.peers.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn peer_by_id(&self, id: &EndpointId) -> Option<Arc<Peer>> {
+        self.peers().into_iter().find(|p| &p.id == id)
     }
 
     /// Resolve `-d/--device` (or `default_peer`) to a configured peer.
     pub(crate) fn target(&self, device: Option<&str>) -> Result<Arc<Peer>, String> {
-        let name = self.cfg.target_peer(device).map_err(|e| format!("{e:#}"))?;
-        self.peers
-            .iter()
+        let name = self
+            .cfg()
+            .target_peer(device)
+            .map_err(|e| format!("{e:#}"))?
+            .to_string();
+        self.peers()
+            .into_iter()
             .find(|p| p.name == name)
-            .cloned()
             .ok_or_else(|| format!("unknown device {name:?}"))
+    }
+
+    /// Address hints worth storing on the other side: only with a fixed `listen_port`
+    /// (an ephemeral port changes on every restart), and only our own interface
+    /// addresses on that port (not NAT-mapped ones observed by relays).
+    pub(crate) fn stable_addrs(&self) -> Vec<SocketAddr> {
+        match self.listen_port {
+            Some(port) => hint_addrs(
+                self.ep
+                    .addr()
+                    .ip_addrs()
+                    .copied()
+                    .filter(|a| a.port() == port),
+            ),
+            None => Vec::new(),
+        }
+    }
+
+    /// Our direct addresses right now, best first.
+    pub(crate) fn current_addrs(&self) -> Vec<SocketAddr> {
+        hint_addrs(self.ep.addr().ip_addrs().copied())
+    }
+
+    /// Make `new` the running config: retire peers that left or changed, start the new
+    /// ones, update the handshake allow-list. Grants and services apply to the next
+    /// session. The caller holds `cfg_edit` and has checked `new` (see
+    /// [`Shared::check_config`]).
+    pub(crate) fn apply_config(self: &Arc<Self>, new: Config) -> ReloadReport {
+        let mut report = ReloadReport::default();
+        let mut started = Vec::new();
+        {
+            let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
+            peers.retain(|p| match new.peers.get(&p.name) {
+                Some(pc) if pc.id == p.id && pc.addrs == p.addrs => true,
+                other => {
+                    info!(peer = %p.name, "peer {} config, closing its links",
+                        if other.is_some() { "changed in" } else { "removed from" });
+                    p.retire();
+                    if other.is_some() {
+                        report.changed.push(p.name.clone());
+                    } else {
+                        report.removed.push(p.name.clone());
+                    }
+                    false
+                }
+            });
+            for (name, pc) in &new.peers {
+                if !peers.iter().any(|p| &p.name == name) {
+                    let p = Arc::new(Peer::new(name, pc));
+                    peers.push(p.clone());
+                    started.push(p);
+                    if !report.changed.contains(name) {
+                        report.added.push(name.clone());
+                    }
+                }
+            }
+            peers.sort_by(|a, b| a.name.cmp(&b.name));
+            *self.gate.allowed.write().unwrap_or_else(|e| e.into_inner()) =
+                peers.iter().map(|p| p.id).collect();
+        }
+        if new.device.name != self.device {
+            report.needs_restart.push("[device] name".into());
+        }
+        if new.device.listen_port != self.listen_port {
+            report.needs_restart.push("[device] listen_port".into());
+        }
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = new;
+        for p in started {
+            info!(peer = %p.name, "peer added");
+            tokio::spawn(supervise(self.ep.clone(), self.clone(), p));
+        }
+        report
+    }
+
+    /// Checks that only make sense for the running daemon.
+    pub(crate) fn check_config(&self, cfg: &Config) -> Result<()> {
+        if cfg.peers.values().any(|p| p.id == self.id) {
+            bail!("a configured peer has this device's own id");
+        }
+        Ok(())
+    }
+
+    /// `enishi reload`: re-read the config file and apply it.
+    async fn reload(self: &Arc<Self>) -> IpcResponse {
+        let _edit = self.cfg_edit.lock().await;
+        let cfg = match Config::load(&self.paths.config_file)
+            .and_then(|c| self.check_config(&c).map(|_| c))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reload refused, keeping the running config: {e:#}");
+                return IpcResponse::Error {
+                    code: exit::USAGE,
+                    message: format!("config not reloaded (running config unchanged): {e:#}"),
+                };
+            }
+        };
+        let report = self.apply_config(cfg);
+        info!(?report, "config reloaded");
+        IpcResponse::Reloaded(report)
     }
 
     fn hello(&self, resume: bool) -> Hello {
@@ -181,8 +354,9 @@ impl Shared {
     fn handle_ipc(&self, req: IpcRequest) -> IpcResponse {
         match req {
             IpcRequest::Status { device } => {
+                let peers = self.peers();
                 if let Some(d) = &device
-                    && !self.peers.iter().any(|p| &p.name == d)
+                    && !peers.iter().any(|p| &p.name == d)
                 {
                     return IpcResponse::Error {
                         code: exit::USAGE,
@@ -194,18 +368,20 @@ impl Shared {
                     device: self.device.clone(),
                     id: self.id.to_string(),
                     version: VERSION.into(),
-                    peers: self
-                        .peers
+                    peers: peers
                         .iter()
                         .filter(|p| device.as_ref().is_none_or(|d| &p.name == d))
                         .map(|p| p.status(now))
                         .collect(),
                 })
             }
-            IpcRequest::Exec { .. } => IpcResponse::Error {
-                code: exit::USAGE,
-                message: "exec needs a streaming IPC connection".into(),
-            },
+            IpcRequest::PairInvite { name, ttl_secs } => self.pair_invite(name, ttl_secs),
+            IpcRequest::Exec { .. } | IpcRequest::PairJoin { .. } | IpcRequest::Reload => {
+                IpcResponse::Error {
+                    code: exit::USAGE,
+                    message: "request needs the async IPC path".into(),
+                }
+            }
         }
     }
 }
@@ -241,20 +417,52 @@ impl<K: std::hash::Hash + Eq> RateLimit<K> {
     }
 }
 
-/// Rejects every peer that is not in the config, right after the TLS handshake.
+/// Admission state read by the handshake hook.
 #[derive(Debug)]
-struct AllowList {
-    ids: Vec<EndpointId>,
+pub(crate) struct Gate {
+    /// Ids of the configured peers.
+    allowed: RwLock<HashSet<EndpointId>>,
+    pub(crate) invites: Mutex<InviteBook>,
     log: RateLimit<EndpointId>,
 }
+
+impl Gate {
+    pub(crate) fn invites(&self) -> std::sync::MutexGuard<'_, InviteBook> {
+        self.invites.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Right after the TLS handshake: rejects every peer that is not in the config, except
+/// on `enishi/pair/1`, which unknown devices may use while this daemon has an invite
+/// out (the secret is checked on the stream). Our own outgoing pairing dials pass.
+#[derive(Debug)]
+struct AllowList(Arc<Gate>);
 
 impl EndpointHooks for AllowList {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
-        if self.ids.contains(&id) {
+        if conn.alpn() == ALPN_PAIR {
+            if conn.side() == Side::Client
+                || self.0.invites().any(Instant::now(), SystemTime::now())
+            {
+                return AfterHandshakeOutcome::Accept;
+            }
+            debug!(peer = %id, "rejected pairing connection: no invite out");
+            return AfterHandshakeOutcome::Reject {
+                error_code: CLOSE_REJECTED.into(),
+                reason: b"no pending invite".to_vec(),
+            };
+        }
+        let known = self
+            .0
+            .allowed
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id);
+        if known {
             AfterHandshakeOutcome::Accept
         } else {
-            if self.log.allow(id, Instant::now()) {
+            if self.0.log.allow(id, Instant::now()) {
                 warn!(peer = %id, "rejected connection from unknown peer (logged once a minute)");
             } else {
                 debug!(peer = %id, "rejected connection from unknown peer");
@@ -274,44 +482,23 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
 
     let id = key.public();
     let instance = u64::from_le_bytes(SecretKey::generate().to_bytes()[..8].try_into()?);
-    let peers: Vec<Arc<Peer>> = cfg
-        .peers
-        .iter()
-        .map(|(name, p)| {
-            let mut addr = EndpointAddr::new(p.id);
-            for a in &p.addrs {
-                addr = addr.with_ip_addr(*a);
-            }
-            Arc::new(Peer {
-                name: name.clone(),
-                id: p.id,
-                addr,
-                state: Mutex::new(PeerState {
-                    presence: Presence::Offline,
-                    since: Instant::now(),
-                    last_seen: None,
-                    rtt: None,
-                    last_error: None,
-                    remote_instance: None,
-                    force_reset: false,
-                    stream: None,
-                }),
-                wake: Notify::new(),
-                resume: AtomicBool::new(false),
-            })
-        })
-        .collect();
-    if peers.iter().any(|p| p.id == id) {
+    if cfg.peers.values().any(|p| p.id == id) {
         bail!("a configured peer has this device's own id");
     }
 
+    let gate = Arc::new(Gate {
+        allowed: RwLock::new(HashSet::new()),
+        invites: Mutex::new(InviteBook::default()),
+        log: RateLimit::new(REJECT_LOG_EVERY),
+    });
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(key)
-        .alpns(vec![ALPN_CTL.to_vec(), ALPN_STREAM.to_vec()])
-        .hooks(AllowList {
-            ids: peers.iter().map(|p| p.id).collect(),
-            log: RateLimit::new(REJECT_LOG_EVERY),
-        });
+        .alpns(vec![
+            ALPN_CTL.to_vec(),
+            ALPN_STREAM.to_vec(),
+            ALPN_PAIR.to_vec(),
+        ])
+        .hooks(AllowList(gate.clone()));
     if let Some(port) = cfg.device.listen_port {
         builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))?;
     }
@@ -321,23 +508,30 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         device: cfg.device.name.clone(),
         id,
         instance,
-        by_id: peers.iter().map(|p| (p.id, p.clone())).collect(),
-        peers,
+        listen_port: cfg.device.listen_port,
+        ep: ep.clone(),
         audit: Audit::new(paths.dir.join(AUDIT_FILE)),
-        cfg,
+        paths,
+        peers: RwLock::new(Vec::new()),
+        cfg: RwLock::new(Config {
+            peers: Default::default(),
+            ..cfg.clone()
+        }),
+        gate,
+        cfg_edit: tokio::sync::Mutex::new(()),
     });
+    let n_peers = cfg.peers.len();
+    // Starts a supervisor per peer and fills the allow-list.
+    shared.apply_config(cfg);
     info!(
         device = %shared.device,
         id = %id,
-        port = ?shared.cfg.device.listen_port,
+        port = ?shared.listen_port,
         ipc = %listener.display(),
-        peers = shared.peers.len(),
+        peers = n_peers,
         "daemon up"
     );
 
-    for p in &shared.peers {
-        tokio::spawn(supervise(ep.clone(), shared.clone(), p.clone()));
-    }
     tokio::spawn(accept_loop(ep.clone(), shared.clone()));
     tokio::spawn(watch_clock(shared.clone()));
 
@@ -385,6 +579,14 @@ where
     match req {
         IpcRequest::Exec { device, request } => {
             session::exec_client(sh, stream, device, request).await
+        }
+        IpcRequest::PairJoin { code, name } => {
+            let resp = sh.pair_join(code, name).await;
+            wire::write_frame(&mut stream, &resp).await
+        }
+        IpcRequest::Reload => {
+            let resp = sh.reload().await;
+            wire::write_frame(&mut stream, &resp).await
         }
         other => {
             let resp = sh.handle_ipc(other);
@@ -447,9 +649,17 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
     let mut backoff = BACKOFF_MIN;
     let mut last_err = String::new();
     loop {
+        if peer.is_retired() {
+            debug!(peer = %peer.name, "supervisor exits (peer retired)");
+            return;
+        }
         let resume = peer.resume.swap(false, Ordering::SeqCst);
         let t = Instant::now();
-        let err = match tokio::time::timeout(CONNECT_TIMEOUT, dial(&ep, &sh, &peer, resume)).await {
+        let dialed = tokio::select! {
+            r = tokio::time::timeout(CONNECT_TIMEOUT, dial(&ep, &sh, &peer, resume)) => r,
+            _ = peer.until_retired() => continue,
+        };
+        let err = match dialed {
             Ok(Ok((conn, stream, hello))) => {
                 backoff = BACKOFF_MIN;
                 last_err.clear();
@@ -471,10 +681,13 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                     "ONLINE (connect {} ms)",
                     t.elapsed().as_millis()
                 );
-                let why = heartbeat(&conn, &stream, &peer).await;
-                conn.close(CLOSE_RESET.into(), b"reset");
+                let (why, code) = tokio::select! {
+                    why = heartbeat(&conn, &stream, &peer) => (why, CLOSE_RESET),
+                    _ = peer.until_retired() => ("removed from config".to_string(), CLOSE_REMOVED),
+                };
+                conn.close(code.into(), b"reset");
                 // Sessions in flight on a dead link fail now instead of hanging.
-                stream.close(CLOSE_RESET.into(), b"reset");
+                stream.close(code.into(), b"reset");
                 {
                     let mut s = peer.state();
                     s.stream = None;
@@ -507,6 +720,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                 backoff = BACKOFF_MIN;
                 continue;
             }
+            _ = peer.until_retired() => continue,
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
@@ -555,20 +769,31 @@ async fn accept_loop(ep: Endpoint, sh: Arc<Shared>) {
                 }
             };
             let id = conn.remote_id();
+            let alpn = conn.alpn().to_vec();
+            if alpn == ALPN_PAIR {
+                pairing::serve_pair(conn, sh).await;
+                return;
+            }
             // The handshake hook already rejects unknown ids; double-check here.
-            let Some(peer) = sh.by_id.get(&id).cloned() else {
+            let Some(peer) = sh.peer_by_id(&id) else {
                 conn.close(CLOSE_REJECTED.into(), b"unknown peer");
                 return;
             };
-            let alpn = conn.alpn().to_vec();
-            if alpn == ALPN_CTL {
-                debug!(peer = %peer.name, "incoming ctl connection");
-                serve_ctl(conn, sh, peer).await;
-            } else if alpn == ALPN_STREAM {
-                debug!(peer = %peer.name, "incoming stream connection");
-                session::serve_streams(conn, sh, peer).await;
-            } else {
-                conn.close(CLOSE_REJECTED.into(), b"unsupported alpn");
+            let serve = async {
+                if alpn == ALPN_CTL {
+                    debug!(peer = %peer.name, "incoming ctl connection");
+                    serve_ctl(conn.clone(), sh, peer.clone()).await;
+                } else if alpn == ALPN_STREAM {
+                    debug!(peer = %peer.name, "incoming stream connection");
+                    session::serve_streams(conn.clone(), sh, peer.clone()).await;
+                } else {
+                    conn.close(CLOSE_REJECTED.into(), b"unsupported alpn");
+                }
+            };
+            tokio::select! {
+                _ = serve => {}
+                // Unpaired/replaced while connected: drop its links (and sessions).
+                _ = peer.until_retired() => conn.close(CLOSE_REMOVED.into(), b"removed"),
             }
         });
     }
@@ -616,7 +841,7 @@ async fn watch_clock(sh: Arc<Shared>) {
                 "resume detected (wall clock jumped {:.1}s), sending hello to peers",
                 gap.as_secs_f64()
             );
-            for p in &sh.peers {
+            for p in &sh.peers() {
                 p.resume.store(true, Ordering::SeqCst);
                 p.request_reconnect(true);
             }

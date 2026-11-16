@@ -19,6 +19,9 @@ serde_bytes = "0.11"
 serde_json = "1"
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 toml = "0.9"
+toml_edit = "0.25"
+data-encoding = "2"
+subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 enishi-proto = { path = "crates/enishi-proto" }

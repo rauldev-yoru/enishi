@@ -3,12 +3,14 @@
 pub mod ctl;
 pub mod frame;
 pub mod ipc;
+pub mod pair;
 pub mod session;
 
 pub use session::SessionKind;
 
 pub const ALPN_CTL: &[u8] = b"enishi/ctl/1";
 pub const ALPN_STREAM: &[u8] = b"enishi/stream/1";
+pub const ALPN_PAIR: &[u8] = b"enishi/pair/1";
 
 /// Reserved process exit codes for enishi's own failures (remote exit codes pass through).
 pub mod exit {

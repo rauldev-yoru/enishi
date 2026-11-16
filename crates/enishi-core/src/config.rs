@@ -160,8 +160,67 @@ impl Config {
     }
 }
 
+/// Append `[peers.<name>]` to the config text, keeping everything else (comments,
+/// order, formatting) as it was; also set `[device] default_peer` when it is unset.
+/// Returns the new text and whether `default_peer` was set. The caller validates the
+/// result by parsing it before writing it.
+pub fn add_peer_to_toml(
+    text: &str,
+    name: &str,
+    id: &EndpointId,
+    addrs: &[SocketAddr],
+) -> Result<(String, bool)> {
+    use toml_edit::{Array, DocumentMut, Item, Table, value};
+    check_name("peer", name)?;
+    let mut doc: DocumentMut = text.parse().context("config is not valid TOML")?;
+    if doc.get("peers").is_none() {
+        let mut t = Table::new();
+        t.set_implicit(true);
+        doc.insert("peers", Item::Table(t));
+    }
+    let peers = doc["peers"]
+        .as_table_mut()
+        .context("`peers` must be a table ([peers.<name>] sections)")?;
+    if peers.contains_key(name) {
+        bail!("a peer named {name:?} already exists");
+    }
+    let mut t = Table::new();
+    t.decor_mut().set_prefix("\n");
+    t.insert("id", value(id.to_string()));
+    if !addrs.is_empty() {
+        t.insert(
+            "addrs",
+            value(addrs.iter().map(|a| a.to_string()).collect::<Array>()),
+        );
+    }
+    peers.insert(name, Item::Table(t));
+    let device = doc
+        .get_mut("device")
+        .and_then(Item::as_table_mut)
+        .context("config has no [device] table")?;
+    let set_default = !device.contains_key("default_peer");
+    if set_default {
+        device.insert("default_peer", value(name));
+    }
+    let mut out = doc.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok((out, set_default))
+}
+
+/// Replace `path` with `text` atomically (temp file in the same directory + rename), so a
+/// crash never leaves a half-written config.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
 /// Names are used in CLI targets like `device/service`, so keep them simple.
-fn check_name(what: &str, name: &str) -> Result<()> {
+pub(crate) fn check_name(what: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name
             .chars()
@@ -297,6 +356,76 @@ exec = {{ allow = ["git *"], deny = ["rm *"] }}
         assert!(err(&bad_name).contains("may only contain"));
         let bad_addr = format!("[device]\nname = \"x\"\n{peer}addrs = [\"nope\"]\n");
         assert!(toml::from_str::<Config>(&bad_addr).is_err());
+    }
+
+    #[test]
+    fn add_peer_keeps_comments_and_sets_default() {
+        let text = format!(
+            "# my config\n[device]\nname = \"pc\" # inline comment\nlisten_port = 7812\n\n\
+             # the server\n[peers.server]\nid = \"{}\"\n\n[grants.server]\nexec = true\n",
+            id(1)
+        );
+        // default_peer unset → set to the new peer.
+        let new = EndpointId::from_str(&id(2)).unwrap();
+        let addrs: Vec<SocketAddr> = vec!["100.1.2.3:7811".parse().unwrap()];
+        let (out, set) = add_peer_to_toml(&text, "laptop", &new, &addrs).unwrap();
+        assert!(set);
+        for keep in [
+            "# my config",
+            "# inline comment",
+            "# the server",
+            "[grants.server]",
+        ] {
+            assert!(out.contains(keep), "lost {keep:?}:\n{out}");
+        }
+        assert!(
+            out.starts_with(&text[..text.find("listen_port").unwrap()]),
+            "{out}"
+        );
+        let cfg: Config = out.parse().unwrap();
+        assert_eq!(cfg.device.default_peer.as_deref(), Some("laptop"));
+        assert_eq!(cfg.peers["laptop"].id, new);
+        assert_eq!(cfg.peers["laptop"].addrs, addrs);
+        assert_eq!(cfg.peers["server"].id.to_string(), id(1));
+        assert_eq!(
+            cfg.grant("laptop").exec,
+            ExecPolicy::Deny,
+            "pairing grants nothing"
+        );
+        assert!(out.contains("\n\n[peers.laptop]\nid = "), "{out}");
+
+        // default_peer already set → untouched; no addrs → no addrs key.
+        let (out2, set2) =
+            add_peer_to_toml(&out, "tablet", &EndpointId::from_str(&id(3)).unwrap(), &[]).unwrap();
+        assert!(!set2);
+        let cfg2: Config = out2.parse().unwrap();
+        assert_eq!(cfg2.device.default_peer.as_deref(), Some("laptop"));
+        assert!(cfg2.peers["tablet"].addrs.is_empty());
+        // toml_edit groups the new table after the existing [peers.*] ones; nothing else moves.
+        let block = format!("\n[peers.tablet]\nid = \"{}\"\n", id(3));
+        assert_eq!(out2.replacen(&block, "", 1), out, "only inserted:\n{out2}");
+
+        // Collisions and bad names are refused.
+        let e = add_peer_to_toml(&out, "server", &new, &[]).unwrap_err();
+        assert!(e.to_string().contains("already exists"), "{e}");
+        assert!(add_peer_to_toml(&out, "a b", &new, &[]).is_err());
+
+        // A config without any [peers] gets the table.
+        let (out3, _) = add_peer_to_toml("[device]\nname = \"x\"\n", "pc", &new, &[]).unwrap();
+        let cfg3: Config = out3.parse().unwrap();
+        assert_eq!(cfg3.peers.len(), 1);
+    }
+
+    #[test]
+    fn write_atomic_replaces() {
+        let dir = std::env::temp_dir().join(format!("enishi-wa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("enishi.toml");
+        std::fs::write(&p, "old").unwrap();
+        write_atomic(&p, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
+        assert!(!dir.join("enishi.toml.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

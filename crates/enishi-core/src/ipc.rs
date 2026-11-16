@@ -39,15 +39,24 @@ pub async fn connect(paths: &Paths) -> Result<ClientStream, ClientError> {
 
 /// Send one request to the local daemon.
 pub async fn request(paths: &Paths, req: &IpcRequest) -> Result<IpcResponse, ClientError> {
+    request_timeout(paths, req, CLIENT_TIMEOUT).await
+}
+
+/// [`request`] with a custom bound, for requests that wait on the network (pairing).
+pub async fn request_timeout(
+    paths: &Paths,
+    req: &IpcRequest,
+    timeout: Duration,
+) -> Result<IpcResponse, ClientError> {
     let mut stream = connect(paths).await?;
     let exchange = async {
         wire::write_frame(&mut stream, req).await?;
         wire::read_frame::<_, IpcResponse>(&mut stream).await
     };
-    match tokio::time::timeout(CLIENT_TIMEOUT, exchange).await {
+    match tokio::time::timeout(timeout, exchange).await {
         Ok(r) => r.map_err(ClientError::Other),
         Err(_) => Err(ClientError::Other(anyhow::anyhow!(
-            "daemon did not answer within {CLIENT_TIMEOUT:?}"
+            "daemon did not answer within {timeout:?}"
         ))),
     }
 }
@@ -216,7 +225,7 @@ mod tests {
                     code: exit::NOT_ALLOWED,
                     message: format!("{device:?}"),
                 },
-                IpcRequest::Exec { .. } => unreachable!(),
+                _ => unreachable!(),
             })
             .await
             .unwrap();

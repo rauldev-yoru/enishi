@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -6,11 +6,12 @@ use enishi_core::{
     config::Config,
     identity,
     ipc::{self, ClientError},
+    pair::parse_ttl,
     paths::Paths,
 };
 use enishi_proto::{
     exit,
-    ipc::{IpcRequest, IpcResponse, Presence, StatusReport},
+    ipc::{IpcRequest, IpcResponse, Paired, Presence, ReloadReport, StatusReport},
     session::ExecRequest,
 };
 
@@ -43,6 +44,8 @@ enum Cmd {
     },
     /// Peers, presence and latency (all peers, or only -d <device>)
     Status,
+    /// Re-read enishi.toml in the running daemon (peers, grants, services)
+    Reload,
     /// Run a native command on the device
     ///
     /// The command words are joined into one command line for the device's shell
@@ -82,10 +85,22 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum PairCmd {
-    /// Print a one-time invite code
-    Invite,
-    /// Join using an invite code
-    Join { code: String },
+    /// Print a one-time invite code (run on the device being joined)
+    Invite {
+        /// Name this device will give the joiner (default: the joiner's device name)
+        #[arg(long)]
+        name: Option<String>,
+        /// How long the code stays valid: 90s, 10m, 1h (max 24h)
+        #[arg(long, value_parser = parse_ttl, default_value = "10m")]
+        ttl: Duration,
+    },
+    /// Pair with the device that printed <code> (both daemons must be running)
+    Join {
+        code: String,
+        /// Local name for the other device (default: its device name)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -126,6 +141,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Status => status(&paths, cli.device).await,
+        Cmd::Reload => reload(&paths).await,
+        Cmd::Pair { action } => pair(&paths, action).await,
         Cmd::Exec {
             shell,
             raw,
@@ -149,11 +166,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         other => {
             let name = match other {
-                Cmd::Pair { .. } => "pair",
                 Cmd::Run { .. } => "run",
                 Cmd::Mcp { .. } => "mcp",
                 Cmd::Services => "services",
-                Cmd::Up | Cmd::Id | Cmd::Status | Cmd::Exec { .. } => unreachable!(),
+                Cmd::Up
+                | Cmd::Id
+                | Cmd::Status
+                | Cmd::Reload
+                | Cmd::Pair { .. }
+                | Cmd::Exec { .. } => unreachable!(),
             };
             eprintln!("enishi {name}: not implemented yet");
             Ok(code(exit::USAGE))
@@ -195,6 +216,123 @@ async fn status(paths: &Paths, device: Option<String>) -> Result<ExitCode> {
         Err(ClientError::Other(e)) => Err(e),
         Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
     }
+}
+
+/// One request; daemon/IPC errors become the exit code.
+async fn ask(
+    paths: &Paths,
+    req: &IpcRequest,
+    timeout: Duration,
+) -> Result<Result<IpcResponse, ExitCode>> {
+    match ipc::request_timeout(paths, req, timeout).await {
+        Ok(IpcResponse::Error { code: c, message }) => {
+            eprintln!("enishi: {message}");
+            Ok(Err(code(c)))
+        }
+        Ok(r) => Ok(Ok(r)),
+        Err(e @ ClientError::DaemonDown(_)) => {
+            eprintln!("enishi: {e}");
+            Ok(Err(code(exit::DAEMON_DOWN)))
+        }
+        Err(ClientError::Other(e)) => Err(e),
+    }
+}
+
+async fn pair(paths: &Paths, action: PairCmd) -> Result<ExitCode> {
+    let cfg_path = paths.config_file.display().to_string();
+    match action {
+        PairCmd::Invite { name, ttl } => {
+            let req = IpcRequest::PairInvite {
+                name: name.clone(),
+                ttl_secs: ttl.as_secs(),
+            };
+            match ask(paths, &req, ipc::CLIENT_TIMEOUT).await? {
+                Ok(IpcResponse::Invite {
+                    code,
+                    ttl_secs,
+                    addrs,
+                }) => {
+                    // The code alone on stdout (scriptable); guidance on stderr.
+                    println!("{code}");
+                    eprintln!(
+                        "\nOne-time invite, valid {}. On the other device run:\n  \
+                         enishi pair join {code}\nAddress hints: {}\n\
+                         The new peer gets no rights: to let it run commands here add\n  \
+                         [grants.{}]\n  exec = true\nto {cfg_path} and run `enishi reload`.",
+                        human(ttl_secs * 1000),
+                        if addrs.is_empty() {
+                            "none (discovery only)".into()
+                        } else {
+                            addrs.join(", ")
+                        },
+                        name.as_deref().unwrap_or("<its name>"),
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
+                Err(c) => Ok(c),
+            }
+        }
+        PairCmd::Join { code: invite, name } => {
+            let req = IpcRequest::PairJoin { code: invite, name };
+            // The daemon bounds the network part (10 s); leave room for it.
+            match ask(paths, &req, Duration::from_secs(20)).await? {
+                Ok(IpcResponse::Paired(p)) => {
+                    print!("{}", render_paired(&p));
+                    Ok(ExitCode::SUCCESS)
+                }
+                Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
+                Err(c) => Ok(c),
+            }
+        }
+    }
+}
+
+fn render_paired(p: &Paired) -> String {
+    let mut out = format!(
+        "paired with {:?} as peer {:?} ({})\n",
+        p.device, p.name, p.id
+    );
+    if p.default_peer {
+        out.push_str(&format!("{} is now the default peer\n", p.name));
+    }
+    out.push_str(&format!(
+        "It has no rights here. To let it run commands on this device, add\n  \
+         [grants.{}]\n  exec = true\nto {} and run `enishi reload`.\n",
+        p.name, p.config
+    ));
+    out
+}
+
+async fn reload(paths: &Paths) -> Result<ExitCode> {
+    match ask(paths, &IpcRequest::Reload, ipc::CLIENT_TIMEOUT).await? {
+        Ok(IpcResponse::Reloaded(r)) => {
+            print!("{}", render_reload(&r));
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
+        Err(c) => Ok(c),
+    }
+}
+
+fn render_reload(r: &ReloadReport) -> String {
+    let mut out = String::from("config reloaded (grants and services apply to new sessions)\n");
+    for (what, list) in [
+        ("added", &r.added),
+        ("removed", &r.removed),
+        ("changed", &r.changed),
+    ] {
+        if !list.is_empty() {
+            out.push_str(&format!("peers {what}: {}\n", list.join(", ")));
+        }
+    }
+    if !r.needs_restart.is_empty() {
+        out.push_str(&format!(
+            "needs a daemon restart to take effect: {}\n",
+            r.needs_restart.join(", ")
+        ));
+    }
+    out
 }
 
 fn human(ms: u64) -> String {
@@ -257,6 +395,7 @@ fn render_status(r: &StatusReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enishi_core::pair::DEFAULT_TTL;
     use enishi_proto::ipc::PeerStatus;
 
     #[test]
@@ -299,6 +438,64 @@ mod tests {
             Cli::try_parse_from(["enishi", "exec", "--raw", "--shell", "sh", "--", "ls"]).is_err()
         );
         assert!(Cli::try_parse_from(["enishi", "exec"]).is_err());
+    }
+
+    #[test]
+    fn pair_args() {
+        let cli = Cli::try_parse_from(["enishi", "pair", "invite", "--ttl", "2s", "--name", "pc"])
+            .unwrap();
+        match cli.cmd {
+            Cmd::Pair {
+                action: PairCmd::Invite { name, ttl },
+            } => {
+                assert_eq!(name.as_deref(), Some("pc"));
+                assert_eq!(ttl, Duration::from_secs(2));
+            }
+            _ => panic!("not pair invite"),
+        }
+        match Cli::try_parse_from(["enishi", "pair", "invite"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Pair {
+                action: PairCmd::Invite { ttl, name: None },
+            } => assert_eq!(ttl, DEFAULT_TTL),
+            _ => panic!("not pair invite"),
+        }
+        assert!(Cli::try_parse_from(["enishi", "pair", "invite", "--ttl", "0s"]).is_err());
+        match Cli::try_parse_from(["enishi", "pair", "join", "enishi1-abc", "--name", "srv"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Pair {
+                action: PairCmd::Join { code, name },
+            } => {
+                assert_eq!(code, "enishi1-abc");
+                assert_eq!(name.as_deref(), Some("srv"));
+            }
+            _ => panic!("not pair join"),
+        }
+        let s = render_paired(&Paired {
+            name: "srv".into(),
+            device: "server".into(),
+            id: "abc".into(),
+            default_peer: true,
+            config: "/x/enishi.toml".into(),
+        });
+        assert!(s.contains("srv is now the default peer"), "{s}");
+        assert!(
+            s.contains("[grants.srv]\n  exec = true\nto /x/enishi.toml"),
+            "{s}"
+        );
+        let r = render_reload(&ReloadReport {
+            added: vec!["a".into()],
+            needs_restart: vec!["[device] name".into()],
+            ..Default::default()
+        });
+        assert!(
+            r.contains("peers added: a\n") && r.contains("restart"),
+            "{r}"
+        );
     }
 
     #[test]

@@ -702,13 +702,17 @@ name = "enishi-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "data-encoding",
  "enishi-proto",
  "enishi-svc",
  "iroh",
+ "postcard",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
 ]
 
@@ -3231,6 +3235,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.5",
 ]
 

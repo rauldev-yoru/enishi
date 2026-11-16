@@ -16,6 +16,12 @@ pub enum IpcRequest {
         device: Option<String>,
         request: ExecRequest,
     },
+    /// Create a one-time invite. `name` is the name this device will give the joiner.
+    PairInvite { name: Option<String>, ttl_secs: u64 },
+    /// Pair with the device that printed `code`; `name` is the local name for it.
+    PairJoin { code: String, name: Option<String> },
+    /// Re-read `enishi.toml` and apply peers/grants without a restart.
+    Reload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,6 +34,38 @@ pub enum IpcResponse {
         code: i32,
         message: String,
     },
+    Invite {
+        code: String,
+        ttl_secs: u64,
+        /// Address hints embedded in the code.
+        addrs: Vec<String>,
+    },
+    Paired(Paired),
+    Reloaded(ReloadReport),
+}
+
+/// A pairing that completed on this device.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Paired {
+    /// Local name of the new peer (`[peers.<name>]`).
+    pub name: String,
+    /// The peer's own `[device] name`.
+    pub device: String,
+    pub id: String,
+    /// `default_peer` was unset and now points to this peer.
+    pub default_peer: bool,
+    /// Config file that was updated.
+    pub config: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReloadReport {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Peers whose id or addresses changed (reconnected).
+    pub changed: Vec<String>,
+    /// Settings that only take effect after a restart.
+    pub needs_restart: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
