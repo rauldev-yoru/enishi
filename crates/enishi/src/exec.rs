@@ -13,7 +13,14 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// code for `enishi`.
 pub async fn run(paths: &Paths, req: IpcRequest) -> i32 {
     let code = match session(paths, req).await {
-        Ok(c) => c,
+        Ok(c) => {
+            // A Windows process killed or crashed: say so (the code alone, truncated to
+            // 8 bits by the shell on unix, is meaningless). The code is still returned.
+            if let Some(what) = exit::ntstatus(c) {
+                eprintln!("enishi: remote process exited with {what}");
+            }
+            c
+        }
         Err((c, msg)) => {
             eprintln!("enishi: {msg}");
             c

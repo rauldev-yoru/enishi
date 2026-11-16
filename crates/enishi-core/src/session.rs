@@ -255,7 +255,7 @@ where
         ms(t_ack),
         first_byte.map(ms).unwrap_or_else(|| "-".into()),
         ms(t0.elapsed()),
-        exit_code.map(|c| c.to_string()).unwrap_or_else(|| error.clone().unwrap_or_default()),
+        exit_code.map(exit::describe).unwrap_or_else(|| error.clone().unwrap_or_default()),
     );
     audit(exit_code, error.as_deref());
     Ok(())
@@ -419,7 +419,7 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
         ms(out.total),
         out.out_bytes,
         out.err_bytes,
-        exit_code.map(|c| c.to_string()).unwrap_or_else(|| error.unwrap_or_default().into()),
+        exit_code.map(exit::describe).unwrap_or_else(|| error.unwrap_or_default().into()),
     );
     audit(exit_code, error);
 }

@@ -153,7 +153,10 @@ impl Connector for DaemonConnector {
                         let _ = stderr.flush().await;
                     }
                     Ok(ExecFrame::Exit { code }) => {
-                        eprintln!("enishi mcp {label}: remote service exited with code {code}");
+                        eprintln!(
+                            "enishi mcp {label}: remote service exited with code {}",
+                            exit::describe(code)
+                        );
                         break;
                     }
                     Ok(ExecFrame::Error { code, message }) => {

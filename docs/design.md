@@ -97,6 +97,10 @@ echo data | enishi exec -- wc -c                                  # stdin is str
 - Exit code of the remote process becomes `enishi`'s exit code; enishi's own errors use
   reserved codes (e.g. `255 peer offline`, `254 not allowed`, `253 no such service`,
   `252 daemon not running`; `2` usage errors such as an unknown device).
+- A Windows NTSTATUS-style exit code (≥ `0x40000000`, e.g. a process killed at shutdown,
+  interrupted or crashed) is still propagated as-is, but stderr, the shim and the session
+  logs also name it: `enishi: remote process exited with 0x40010004
+  (DBG_TERMINATE_PROCESS: terminated (shutdown/kill))`; unknown ones print in hex.
 - `--timeout`, `--cwd`, `--env K=V`, `--shell <pwsh|powershell|cmd|bash|sh>`, `--raw`.
 - stdout and stderr are kept separate (two streams), unlike the PoC.
 
