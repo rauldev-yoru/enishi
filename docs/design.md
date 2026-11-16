@@ -89,6 +89,25 @@ echo data | enishi exec -- wc -c                                  # stdin is str
 - `--timeout`, `--cwd`, `--env K=V`, `--shell <pwsh|powershell|cmd|bash|sh>`, `--raw`.
 - stdout and stderr are kept separate (two streams), unlike the PoC.
 
+As implemented (v0.1 step 3):
+
+- Shell mode joins the command words with spaces into one command line: Windows →
+  `pwsh` if on PATH else `powershell`, both `-NoProfile -NoLogo -NonInteractive -Command
+  <line>`; `--shell cmd` → `cmd /d /s /c "<line>"` (passed verbatim); unix → `$SHELL` (else
+  `/bin/sh`) `-c <line>`. `--raw` spawns argv directly (`--raw` and `--shell` conflict).
+- `--cwd` must exist on the device (a leading `~` is the device user's home); `--env`
+  adds to the daemon's environment. Windows children get `CREATE_NO_WINDOW`.
+- Process tree: unix → own process group, killed with `SIGKILL` to the group; Windows →
+  job object, terminated as a whole. The tree is killed on `--timeout`, when the caller
+  goes away (CLI killed, link lost) and when the session is dropped.
+- After the process exits, output from background children still holding the pipes is
+  forwarded until it is quiet for 500 ms, then the tree is killed.
+- More reserved codes, shell-style: `124` timeout (tree killed), `126` cannot execute
+  (e.g. bad `--cwd`), `127` command not found (raw mode). A remote process may of course
+  exit with any of these itself.
+- Presence decides offline: if the daemon has no live link the CLI gets `255` at once
+  (≈3 ms measured) — nothing is dialed on the call path.
+
 ### 3.4 Agent usage (MCP)
 
 ```yaml
@@ -164,6 +183,23 @@ iroh connection per peer pair, kept warm by the daemon. ALPNs:
   `{ok}` or `{err, code, message}` (ack within a bounded timeout — PoC lesson), then raw
   stdio frames multiplexed as `{stdin|stdout|stderr|exit|signal}`.
 
+`enishi/stream/1` as implemented (v0.1 step 3): every daemon keeps a second warm
+connection per peer with this ALPN, dialed right after the ctl hello and dropped with it
+(a close of either marks the peer offline). One bi-stream per session:
+
+1. caller → `SessionKind::Exec(ExecRequest {command, shell, raw, cwd, env, timeout_secs})`
+   (`Service {name, args}` is reserved and answered with `253` for now);
+2. peer → `SessionAck::Ok` or `SessionAck::Err {code, message}` within **3 s**, after
+   authorizing with `authorize_exec` and spawning (so spawn errors come back as acks);
+3. caller → `ExecFrame::Stdin(bytes)…`, `StdinEof` (then finishes its send side);
+   peer → `Stdout(bytes)` / `Stderr(bytes)` (≤ 64 KiB each) and exactly one terminal
+   `Exit {code}` or `Error {code, message}` (e.g. `124` timeout).
+4. The caller resets/stops the stream when its CLI goes away → the peer kills the tree.
+   `signal` frames are not implemented yet.
+
+Both ends log one timing line per session (`exec out`: ack / first byte / end / bytes;
+`exec in`: spawn / first output / exit / out+err bytes) and append an audit line.
+
 Framing: length-prefixed **postcard** frames (D3); the PoC used raw bytes + newline
 header.
 
@@ -184,7 +220,10 @@ backoff; online but a different `instance` (peer restarted) → drop and redial;
 jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true`.
 
 The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
-per connection (`Status {device}` today).
+per connection (`Status {device}`), except `Exec {device, request}`: the daemon answers
+`ExecStarted` (or `Error {code, message}`) and the connection then carries the same
+`ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
+after stdin EOF; closing it means "caller gone".
 
 ## 6. Security
 
@@ -194,6 +233,10 @@ per connection (`Status {device}` today).
 - Default deny; grants per peer (§4). Unknown ids are dropped during the handshake.
 - No listening HTTP, no exposed debug ports. UDP only for QUIC.
 - Audit log (JSONL) of every exec/service session: who, what, when, exit code.
+  Implemented in v0.1 for exec: `<config dir>/audit.jsonl`, one line per session on both
+  ends: `{ts, dir: in|out, peer, cmd, shell?, raw, cwd?, env: [names only], exit,
+  error?, duration_ms}`. Refused and offline attempts are logged too. No rotation yet.
+- "Rejected unknown peer" warnings are rate-limited to one per peer id per minute.
 - Relays: default public iroh relays only carry encrypted traffic; self-hosted relay
   supported for full independence (later).
 
@@ -236,7 +279,7 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | | Scope | Done when |
 |---|---|---|
 | **v0.1** | daemon, pairing, presence, `status`, `exec` (non-interactive), `run`, `mcp`, config + grants, Win logon task, Linux systemd unit | Server ↔ Windows both ways; sleep test passes; an MCP works through `enishi mcp` in a sandboxed agent |
-| v0.2 | `shell` (PTY/ConPTY), `wake`, service catalog sync, audit log, installers | daily driver replacing SSH→WSL |
+| v0.2 | `shell` (PTY/ConPTY), `wake`, service catalog sync, audit log for services (exec audit is in v0.1), installers | daily driver replacing SSH→WSL |
 | v0.3 | macOS, self-hosted relay, pre-logon presence service | third device |
 | later | Android, file/clipboard services, Windows UI/browser services on top | — |
 
@@ -248,4 +291,6 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | **D2** | `exec` runs through the platform shell by default (PowerShell on Windows, `$SHELL`/`sh` on Linux); `--raw` spawns the process directly. |
 | **D3** | Wire frames: length-prefixed postcard. |
 | **D4** | Config: TOML, `enishi.toml` per device. |
-| **D5** | `exec` grant is allow/deny per peer in v0.1, modelled as `ExecPolicy` so allowlists drop in later. |
+| **D5** | `exec` grant is allow/deny per peer in v0.1, modelled as `ExecPolicy` so allowlists drop in later. `Rules {allow, deny}` parses but is denied until enforced (fail closed). |
+| **D6** | Sessions use a dedicated warm `enishi/stream/1` connection next to the ctl one (not extra streams on ctl), so bulk stdio (own congestion window) cannot delay heartbeats into false offlines, while presence still owns the link lifecycle. |
+| **D7** | Exec authorization, spawn and ack happen before any stdio flows; a spawn failure is an ack error (`126`/`127`), never a half-open session. |
