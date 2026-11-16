@@ -1,10 +1,11 @@
 //! Wire types shared by every enishi layer. No I/O here.
 
-use serde::{Deserialize, Serialize};
-
 pub mod ctl;
 pub mod frame;
 pub mod ipc;
+pub mod session;
+
+pub use session::SessionKind;
 
 pub const ALPN_CTL: &[u8] = b"enishi/ctl/1";
 pub const ALPN_STREAM: &[u8] = b"enishi/stream/1";
@@ -17,20 +18,10 @@ pub mod exit {
     pub const DAEMON_DOWN: i32 = 252;
     /// Bad invocation (unknown device, missing config…), same as clap's usage errors.
     pub const USAGE: i32 = 2;
-}
-
-/// First frame of every session stream.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SessionKind {
-    Exec {
-        command: Vec<String>,
-        shell: Option<String>,
-        raw: bool,
-        cwd: Option<String>,
-        env: Vec<(String, String)>,
-    },
-    Service {
-        name: String,
-        args: Vec<String>,
-    },
+    /// The command could not be found (raw spawn), like shells do.
+    pub const COMMAND_NOT_FOUND: i32 = 127;
+    /// The command was found but could not be started (raw spawn), like shells do.
+    pub const CANNOT_EXECUTE: i32 = 126;
+    /// `--timeout` expired and the process tree was killed, like `timeout(1)`.
+    pub const TIMED_OUT: i32 = 124;
 }
