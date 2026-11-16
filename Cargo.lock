@@ -726,6 +726,12 @@ dependencies = [
 [[package]]
 name = "enishi-svc"
 version = "0.0.1"
+dependencies = [
+ "enishi-proto",
+ "libc",
+ "tokio",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "enum-assoc"
