@@ -687,7 +687,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "enishi"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "enishi-core"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "enishi-mcp"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "enishi-core",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "enishi-proto"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "enishi-svc"
-version = "0.1.0-rc.2"
+version = "0.1.0"
 dependencies = [
  "enishi-proto",
  "libc",

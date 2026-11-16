@@ -13,8 +13,9 @@ today; macOS and phone later). Once two devices are paired you can, from either 
 It was built for AI agents that live on a server but need to act on your PC (your real browser,
 your apps, your corporate VPN), and it is just as useful from a plain terminal.
 
-Status: **v0.1 in progress** — link, presence, pairing, `exec`, services, MCP and TCP forwarding
-work and are tested Linux ↔ Windows, and `enishi install` sets it up as a per-user service.
+Status: **v0.1.0** — link, presence, pairing, `exec`, services, MCP and TCP forwarding work
+and are tested Linux ↔ Windows (x86_64), and `enishi install` sets it up as a per-user
+service. See the [changelog](CHANGELOG.md) for what is in it and the known limitations.
 
 ## What enishi is (and is not)
 
