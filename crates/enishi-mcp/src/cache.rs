@@ -137,7 +137,8 @@ mod tests {
         );
         let a = cache_file(b, "pc", "fs", &["x".into()]);
         assert_ne!(a, cache_file(b, "pc", "fs", &["y".into()]));
-        assert!(a.to_string_lossy().starts_with("/c/mcp/pc/fs."));
+        assert_eq!(a.parent(), Some(Path::new("/c/mcp/pc")));
+        assert!(a.file_name().unwrap().to_string_lossy().starts_with("fs."));
         assert_eq!(
             cache_file(b, "..", "a/b", &[]),
             Path::new("/c/mcp/_../a_b.json")

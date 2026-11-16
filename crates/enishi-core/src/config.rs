@@ -51,6 +51,8 @@ pub use enishi_proto::session::ServiceKind;
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub command: Vec<String>,
+    /// `mcp` or `stdio` (default). Informational: listed by `enishi services`.
+    #[serde(default)]
     pub kind: ServiceKind,
     /// Peer names allowed to use this service (the peer also needs it in
     /// `[grants.<peer>] services`).

@@ -23,12 +23,13 @@ pub struct ExecRequest {
 }
 
 /// How a published service speaks on its stdio (`[services.<name>] kind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceKind {
     /// An MCP server (newline-delimited JSON-RPC); consume it with `enishi mcp`.
     Mcp,
-    /// Any other stdio program; consume it with `enishi run`.
+    /// Any other stdio program; consume it with `enishi run` (the default).
+    #[default]
     Stdio,
 }
 
