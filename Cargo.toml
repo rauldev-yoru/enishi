@@ -27,3 +27,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 enishi-proto = { path = "crates/enishi-proto" }
 enishi-core = { path = "crates/enishi-core" }
 enishi-svc = { path = "crates/enishi-svc" }
+enishi-mcp = { path = "crates/enishi-mcp" }

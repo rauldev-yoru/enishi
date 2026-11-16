@@ -1,4 +1,5 @@
-//! Audit log (design §6): one JSON line per exec session in `<config dir>/audit.jsonl`,
+//! Audit log (design §6): one JSON line per exec or service session in
+//! `<config dir>/audit.jsonl`,
 //! on both ends (`dir` = `in` for sessions a peer ran here, `out` for ours on a peer).
 
 use std::{
@@ -29,6 +30,10 @@ pub struct Entry<'a> {
     pub ts: String,
     pub dir: Direction,
     pub peer: &'a str,
+    /// Service sessions: the service name (`cmd` is then the spawned argv on the
+    /// publishing side, the extra args on the calling side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<&'a str>,
     pub cmd: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<&'a str>,
@@ -52,11 +57,29 @@ impl<'a> Entry<'a> {
             ts: rfc3339(SystemTime::now()),
             dir,
             peer,
+            service: None,
             cmd: &req.command,
             shell: req.shell.as_deref(),
             raw: req.raw,
             cwd: req.cwd.as_deref(),
             env: req.env.iter().map(|(k, _)| k.as_str()).collect(),
+            exit: None,
+            error: None,
+            duration_ms: 0,
+        }
+    }
+
+    pub fn service(dir: Direction, peer: &'a str, name: &'a str, cmd: &'a [String]) -> Entry<'a> {
+        Entry {
+            ts: rfc3339(SystemTime::now()),
+            dir,
+            peer,
+            service: Some(name),
+            cmd,
+            shell: None,
+            raw: true,
+            cwd: None,
+            env: Vec::new(),
             exit: None,
             error: None,
             duration_ms: 0,
@@ -164,12 +187,21 @@ mod tests {
             Some("not allowed"),
             Duration::ZERO,
         ));
+        let args = vec!["-l".to_string()];
+        audit.record(&Entry::service(Direction::Out, "pc", "wc", &args).finish(
+            Some(0),
+            None,
+            Duration::ZERO,
+        ));
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<serde_json::Value> = text
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].get("service").is_none());
+        assert_eq!(lines[2]["service"], "wc");
+        assert_eq!(lines[2]["cmd"][0], "-l");
         assert_eq!(lines[0]["dir"], "in");
         assert_eq!(lines[0]["peer"], "pc");
         assert_eq!(lines[0]["cmd"][1], "hi");

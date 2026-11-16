@@ -1,9 +1,10 @@
-//! `enishi/stream/1` exec sessions (design §5), both ends:
+//! `enishi/stream/1` sessions (design §5) — `exec` and published services — both ends:
 //!
-//! - caller: [`exec_client`] relays a local CLI (IPC) to a bi-stream on the warm stream
+//! - caller: [`client`] relays a local CLI (IPC) to a bi-stream on the warm stream
 //!   connection to the peer, with a bounded ack;
 //! - executor: [`serve_streams`] accepts sessions from a peer, authorizes them with
-//!   [`authorize_exec`] and runs them through `enishi_svc::exec`.
+//!   [`authorize_exec`] / [`authorize_service`] and runs them through `enishi_svc::exec`
+//!   (services: their argv spawned directly, no shell).
 //!
 //! Both ends log per-session timings and append one audit line.
 
@@ -16,7 +17,7 @@ use anyhow::Result;
 use enishi_proto::{
     SessionKind, exit,
     ipc::{IpcResponse, Presence},
-    session::{ExecFrame, ExecRequest, SessionAck},
+    session::{ExecFrame, SessionAck},
 };
 use enishi_svc::exec::{self as svc, End};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -29,7 +30,7 @@ use tracing::{debug, info, warn};
 use crate::{
     audit::{Direction, Entry},
     daemon::{Peer, Shared},
-    policy::authorize_exec,
+    policy::{authorize_exec, authorize_service, service_command},
     wire,
 };
 
@@ -51,16 +52,33 @@ fn show(cmd: &[String]) -> String {
     }
 }
 
+/// `("exec", command)` or `("service", name)` for log lines.
+fn describe(h: &SessionKind) -> (&'static str, String) {
+    match h {
+        SessionKind::Exec(r) => ("exec", show(&r.command)),
+        SessionKind::Service { name, args } if args.is_empty() => ("service", name.clone()),
+        SessionKind::Service { name, args } => ("service", format!("{name} {}", show(args))),
+    }
+}
+
+fn entry<'a>(dir: Direction, peer: &'a str, h: &'a SessionKind) -> Entry<'a> {
+    match h {
+        SessionKind::Exec(r) => Entry::exec(dir, peer, r),
+        SessionKind::Service { name, args } => Entry::service(dir, peer, name, args),
+    }
+}
+
 async fn reply<S: AsyncWrite + Unpin>(ipc: &mut S, code: i32, message: String) -> Result<()> {
     wire::write_frame(ipc, &IpcResponse::Error { code, message }).await
 }
 
-/// Caller side: run `req` on `device` for the CLI connected on `ipc`.
-pub(crate) async fn exec_client<S>(
+/// Caller side: open the session `header` (exec or service) on `device` for the CLI
+/// connected on `ipc`.
+pub(crate) async fn client<S>(
     sh: Arc<Shared>,
     mut ipc: S,
     device: Option<String>,
-    req: ExecRequest,
+    header: SessionKind,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -70,13 +88,10 @@ where
         Err(message) => return reply(&mut ipc, exit::USAGE, message).await,
     };
     let t0 = Instant::now();
+    let (word, what) = describe(&header);
     let audit = |exit: Option<i32>, error: Option<&str>| {
         sh.audit
-            .record(&Entry::exec(Direction::Out, &peer.name, &req).finish(
-                exit,
-                error,
-                t0.elapsed(),
-            ));
+            .record(&entry(Direction::Out, &peer.name, &header).finish(exit, error, t0.elapsed()));
     };
     // Presence decides: never dial on the call path.
     let online = {
@@ -98,7 +113,6 @@ where
         }
     };
 
-    let header = SessionKind::Exec(req.clone());
     let open = async {
         let (mut send, mut recv) = conn.open_bi().await?;
         wire::write_frame(&mut send, &header).await?;
@@ -108,7 +122,7 @@ where
     let (mut send, mut recv) = match tokio::time::timeout(ACK_TIMEOUT, open).await {
         Ok(Ok((s, r, SessionAck::Ok))) => (s, r),
         Ok(Ok((_, _, SessionAck::Err { code, message }))) => {
-            info!(peer = %peer.name, code, "exec refused: {message}");
+            info!(peer = %peer.name, code, "{word} `{what}` refused: {message}");
             audit(None, Some(&message));
             return reply(&mut ipc, code, format!("{}: {message}", peer.name)).await;
         }
@@ -230,8 +244,7 @@ where
     };
     info!(
         peer = %peer.name,
-        "exec out `{}`: ack={}ms first_byte={}ms end={}ms bytes={bytes} exit={}",
-        show(&req.command),
+        "{word} out `{what}`: ack={}ms first_byte={}ms end={}ms bytes={bytes} exit={}",
         ms(t_ack),
         first_byte.map(ms).unwrap_or_else(|| "-".into()),
         ms(t0.elapsed()),
@@ -260,38 +273,53 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
         Ok(Err(e)) => return debug!(peer = %peer.name, "session header: {e:#}"),
         Err(_) => return debug!(peer = %peer.name, "session header timed out"),
     };
-    let req = match header {
-        SessionKind::Exec(r) => r,
-        SessionKind::Service { name, .. } => {
-            let _ = refuse(
-                &mut send,
-                exit::NO_SUCH_SERVICE,
-                format!("service {name:?}: services are not implemented yet"),
-            )
-            .await;
-            return;
+    let t0 = Instant::now();
+    let (word, what) = describe(&header);
+    // Services: authorize, then the service's argv (no shell) is the process to spawn.
+    let (req, service) = match header {
+        SessionKind::Exec(r) => (r, None),
+        SessionKind::Service { name, args } => {
+            let planned = {
+                let cfg = sh.cfg();
+                authorize_service(&cfg, &peer.name, &name, &args).map(|s| service_command(s, &args))
+            };
+            match planned {
+                Ok(req) => (req, Some(name)),
+                Err(r) => {
+                    warn!(peer = %peer.name, code = r.code, "service `{what}` refused: {}", r.message);
+                    sh.audit.record(
+                        &Entry::service(Direction::In, &peer.name, &name, &args).finish(
+                            None,
+                            Some(&r.message),
+                            t0.elapsed(),
+                        ),
+                    );
+                    let _ = refuse(&mut send, r.code, r.message).await;
+                    return;
+                }
+            }
         }
     };
-    let t0 = Instant::now();
     let audit = |exit: Option<i32>, error: Option<&str>| {
-        sh.audit
-            .record(&Entry::exec(Direction::In, &peer.name, &req).finish(
-                exit,
-                error,
-                t0.elapsed(),
-            ));
+        let e = match &service {
+            Some(name) => Entry::service(Direction::In, &peer.name, name, &req.command),
+            None => Entry::exec(Direction::In, &peer.name, &req),
+        };
+        sh.audit.record(&e.finish(exit, error, t0.elapsed()));
     };
-    let policy = sh.grant(&peer.name).exec;
-    if let Err(why) = authorize_exec(&policy, &req.command) {
-        warn!(peer = %peer.name, "exec denied `{}`: {why}", show(&req.command));
-        audit(None, Some(why));
-        let _ = refuse(&mut send, exit::NOT_ALLOWED, why.into()).await;
-        return;
+    if service.is_none() {
+        let policy = sh.grant(&peer.name).exec;
+        if let Err(why) = authorize_exec(&policy, &req.command) {
+            warn!(peer = %peer.name, "exec denied `{what}`: {why}");
+            audit(None, Some(why));
+            let _ = refuse(&mut send, exit::NOT_ALLOWED, why.into()).await;
+            return;
+        }
     }
     let running = match svc::spawn(&req) {
         Ok(r) => r,
         Err(e) => {
-            info!(peer = %peer.name, "exec `{}` failed to start: {e}", show(&req.command));
+            info!(peer = %peer.name, "{word} `{what}` failed to start: {e}");
             audit(None, Some(&e.message));
             let _ = refuse(&mut send, e.code, e.message).await;
             return;
@@ -301,7 +329,7 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
         audit(None, Some("caller gone before ack"));
         return; // `running` is dropped: kill_on_drop.
     }
-    debug!(peer = %peer.name, pid = ?running.id(), program = %running.plan.program, "exec started");
+    debug!(peer = %peer.name, pid = ?running.id(), program = %running.plan.program, "{word} started");
 
     // caller → process stdin; closing `in_tx` is EOF.
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -356,8 +384,7 @@ async fn serve_session(sh: Arc<Shared>, peer: Arc<Peer>, mut send: SendStream, r
     };
     info!(
         peer = %peer.name,
-        "exec in `{}`: spawn={}ms first_out={}ms eof={}ms reaped={}ms exit={}ms out={}B err={}B result={}",
-        show(&req.command),
+        "{word} in `{what}`: spawn={}ms first_out={}ms eof={}ms reaped={}ms exit={}ms out={}B err={}B result={}",
         ms(out.spawn),
         out.first_out.map(ms).unwrap_or_else(|| "-".into()),
         out.eof.map(ms).unwrap_or_else(|| "-".into()),

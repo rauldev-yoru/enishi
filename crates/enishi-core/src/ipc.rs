@@ -37,6 +37,35 @@ pub async fn connect(paths: &Paths) -> Result<ClientStream, ClientError> {
         .map_err(|e| ClientError::DaemonDown(format!("{}: {e}", paths.ipc_display())))
 }
 
+/// Start a streaming session (`Exec` / `Run`): returns the connection once the daemon
+/// answered [`IpcResponse::ExecStarted`]; `ExecFrame`s follow on it. Errors carry the
+/// `enishi_proto::exit` code to report. Keep the connection open until the session ends:
+/// closing it tells the daemon the caller is gone (the remote process is killed).
+pub async fn open_session(paths: &Paths, req: &IpcRequest) -> Result<ClientStream, (i32, String)> {
+    use enishi_proto::exit;
+    let mut stream = connect(paths)
+        .await
+        .map_err(|e| (exit::DAEMON_DOWN, e.to_string()))?;
+    let exchange = async {
+        wire::write_frame(&mut stream, req).await?;
+        wire::read_frame::<_, IpcResponse>(&mut stream).await
+    };
+    let resp = tokio::time::timeout(CLIENT_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            (
+                exit::DAEMON_DOWN,
+                format!("daemon did not answer within {CLIENT_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| (exit::DAEMON_DOWN, format!("daemon connection lost: {e:#}")))?;
+    match resp {
+        IpcResponse::ExecStarted => Ok(stream),
+        IpcResponse::Error { code, message } => Err((code, message)),
+        other => Err((exit::DAEMON_DOWN, format!("unexpected reply {other:?}"))),
+    }
+}
+
 /// Send one request to the local daemon.
 pub async fn request(paths: &Paths, req: &IpcRequest) -> Result<IpcResponse, ClientError> {
     request_timeout(paths, req, CLIENT_TIMEOUT).await

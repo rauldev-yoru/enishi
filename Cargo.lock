@@ -692,6 +692,7 @@ dependencies = [
  "anyhow",
  "clap",
  "enishi-core",
+ "enishi-mcp",
  "enishi-proto",
  "tokio",
  "tracing-subscriber",
@@ -719,6 +720,12 @@ dependencies = [
 [[package]]
 name = "enishi-mcp"
 version = "0.0.1"
+dependencies = [
+ "enishi-core",
+ "enishi-proto",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "enishi-proto"

@@ -1,20 +1,18 @@
-//! `enishi exec`: the CLI end of an exec session, relayed by the local daemon.
+//! `enishi exec` / `enishi run`: the CLI end of a session (exec or published service),
+//! relayed by the local daemon.
 
-use enishi_core::{
-    ipc::{self, ClientError},
-    paths::Paths,
-    wire,
-};
+use enishi_core::{ipc, paths::Paths, wire};
 use enishi_proto::{
     exit,
-    ipc::{IpcRequest, IpcResponse},
-    session::{ExecFrame, ExecRequest, MAX_CHUNK},
+    ipc::IpcRequest,
+    session::{ExecFrame, MAX_CHUNK},
 };
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Run the session; returns the process exit code for `enishi`.
-pub async fn run(paths: &Paths, device: Option<String>, request: ExecRequest) -> i32 {
-    let code = match session(paths, device, request).await {
+/// Run the session (`IpcRequest::Exec` or `IpcRequest::Run`); returns the process exit
+/// code for `enishi`.
+pub async fn run(paths: &Paths, req: IpcRequest) -> i32 {
+    let code = match session(paths, req).await {
         Ok(c) => c,
         Err((c, msg)) => {
             eprintln!("enishi: {msg}");
@@ -26,37 +24,9 @@ pub async fn run(paths: &Paths, device: Option<String>, request: ExecRequest) ->
     code
 }
 
-async fn session(
-    paths: &Paths,
-    device: Option<String>,
-    request: ExecRequest,
-) -> Result<i32, (i32, String)> {
-    let mut stream = ipc::connect(paths).await.map_err(|e| match e {
-        e @ ClientError::DaemonDown(_) => (exit::DAEMON_DOWN, e.to_string()),
-        ClientError::Other(e) => (exit::DAEMON_DOWN, format!("{e:#}")),
-    })?;
+async fn session(paths: &Paths, req: IpcRequest) -> Result<i32, (i32, String)> {
+    let stream = ipc::open_session(paths, &req).await?;
     let lost = |e: anyhow::Error| (exit::DAEMON_DOWN, format!("daemon connection lost: {e:#}"));
-    wire::write_frame(&mut stream, &IpcRequest::Exec { device, request })
-        .await
-        .map_err(lost)?;
-    let resp = tokio::time::timeout(
-        ipc::CLIENT_TIMEOUT,
-        wire::read_frame::<_, IpcResponse>(&mut stream),
-    )
-    .await
-    .map_err(|_| {
-        (
-            exit::DAEMON_DOWN,
-            format!("daemon did not answer within {:?}", ipc::CLIENT_TIMEOUT),
-        )
-    })?
-    .map_err(lost)?;
-    match resp {
-        IpcResponse::ExecStarted => {}
-        IpcResponse::Error { code, message } => return Err((code, message)),
-        other => return Err((exit::DAEMON_DOWN, format!("unexpected reply {other:?}"))),
-    }
-
     let (mut r, mut w) = tokio::io::split(stream);
     // stdin → daemon. The write half stays open after EOF: closing the connection would
     // tell the daemon that we are gone and the remote process must be killed.

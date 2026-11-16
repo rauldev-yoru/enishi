@@ -22,11 +22,44 @@ pub struct ExecRequest {
     pub timeout_secs: Option<u64>,
 }
 
+/// How a published service speaks on its stdio (`[services.<name>] kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceKind {
+    /// An MCP server (newline-delimited JSON-RPC); consume it with `enishi mcp`.
+    Mcp,
+    /// Any other stdio program; consume it with `enishi run`.
+    Stdio,
+}
+
+impl ServiceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceKind::Mcp => "mcp",
+            ServiceKind::Stdio => "stdio",
+        }
+    }
+}
+
+/// A service as listed to a peer (`enishi services`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub name: String,
+    pub kind: ServiceKind,
+    /// Extra args after `--` are forwarded to the command.
+    pub allow_args: bool,
+}
+
 /// First frame of every session stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionKind {
     Exec(ExecRequest),
-    Service { name: String, args: Vec<String> },
+    /// Open the published service `name`; `args` are appended to its command only if the
+    /// service has `allow_args`.
+    Service {
+        name: String,
+        args: Vec<String>,
+    },
 }
 
 /// The peer's answer to a [`SessionKind`] header.
@@ -40,7 +73,7 @@ pub enum SessionAck {
     },
 }
 
-/// Multiplexed stdio of an exec session. `Stdin*` flow towards the process; the rest flow
+/// Multiplexed stdio of an exec or service session. `Stdin*` flow towards the process; the rest flow
 /// back to the caller. Exactly one `Exit` or `Error` frame ends a session.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExecFrame {
@@ -102,6 +135,17 @@ mod tests {
             name: "fs".into(),
             args: vec![],
         });
+        rt(ServiceInfo {
+            name: "fs".into(),
+            kind: ServiceKind::Mcp,
+            allow_args: true,
+        });
+        rt(crate::ctl::CtlResponse::Services(vec![ServiceInfo {
+            name: "wc".into(),
+            kind: ServiceKind::Stdio,
+            allow_args: false,
+        }]));
+        rt(crate::ctl::CtlRequest::Services);
         rt(SessionAck::Ok);
         rt(SessionAck::Err {
             code: crate::exit::NOT_ALLOWED,

@@ -43,24 +43,28 @@ pub struct PeerConfig {
     pub addrs: Vec<SocketAddr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceKind {
-    Mcp,
-    Stdio,
-}
+pub use enishi_proto::session::ServiceKind;
 
+/// A published stdio service (`[services.<name>]`). Spawned directly from `command` (argv,
+/// no shell) for every session; see [`crate::policy::authorize_service`] for who may open it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub command: Vec<String>,
     pub kind: ServiceKind,
-    /// Peer names allowed to use this service.
+    /// Peer names allowed to use this service (the peer also needs it in
+    /// `[grants.<peer>] services`).
     #[serde(default)]
     pub allow: Vec<String>,
     /// Forward extra client args to the command.
     #[serde(default)]
     pub allow_args: bool,
+    /// Working directory (a leading `~` is this device user's home). Default: the daemon's.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Extra environment for the process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -264,6 +268,8 @@ allow_args = false
 [services.ps]
 command = ["pwsh"]
 kind = "stdio"
+cwd = "~"
+env = {{ A = "1" }}
 
 [grants.windows-home]
 exec = true
@@ -290,6 +296,9 @@ exec = {{ allow = ["git *"], deny = ["rm *"] }}
         assert_eq!(c.services["fs"].kind, ServiceKind::Mcp);
         assert_eq!(c.services["ps"].kind, ServiceKind::Stdio);
         assert!(!c.services["ps"].allow_args);
+        assert_eq!(c.services["ps"].cwd.as_deref(), Some("~"));
+        assert_eq!(c.services["ps"].env["A"], "1");
+        assert!(c.services["fs"].env.is_empty() && c.services["fs"].cwd.is_none());
         assert_eq!(c.grant("windows-home").exec, ExecPolicy::Flag(true));
         assert_eq!(c.grant("windows-home").services, vec!["fs", "ps"]);
         assert!(matches!(c.grant("laptop").exec, ExecPolicy::Rules { .. }));

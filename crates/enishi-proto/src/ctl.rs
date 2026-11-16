@@ -19,7 +19,11 @@ pub struct Hello {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CtlRequest {
     Hello(Hello),
-    Ping { seq: u64 },
+    Ping {
+        seq: u64,
+    },
+    /// The services the receiver publishes to the sender (only those it may open).
+    Services,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,4 +31,5 @@ pub enum CtlResponse {
     Hello(Hello),
     Pong { seq: u64 },
     Error { message: String },
+    Services(Vec<crate::session::ServiceInfo>),
 }

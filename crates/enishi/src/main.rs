@@ -12,7 +12,7 @@ use enishi_core::{
 use enishi_proto::{
     exit,
     ipc::{IpcRequest, IpcResponse, Paired, Presence, ReloadReport, StatusReport},
-    session::ExecRequest,
+    session::{ExecRequest, ServiceInfo, ServiceKind},
 };
 
 mod exec;
@@ -72,9 +72,21 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Pipe local stdio to a service published by the device
-    Run { service: String },
+    ///
+    /// Raw stdin/stdout/stderr and the service's exit code, like exec. Extra args after
+    /// `--` only if the service has allow_args. 253 no such service, 254 not allowed.
+    Run {
+        service: String,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Expose a remote MCP service as a local stdio MCP server: `enishi mcp windows-home/fs`
+    ///
+    /// Offline-aware: initialize and the list methods are answered from a local cache
+    /// while the device is unreachable (or the local daemon is down), other requests fail
+    /// at once, and the session resumes by itself when the device is back.
     Mcp {
+        /// <service> or <device>/<service>
         target: String,
         #[arg(last = true)]
         args: Vec<String>,
@@ -159,27 +171,110 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 env,
                 timeout_secs: timeout,
             };
-            let c = exec::run(&paths, cli.device, request).await;
+            let c = exec::run(
+                &paths,
+                IpcRequest::Exec {
+                    device: cli.device,
+                    request,
+                },
+            )
+            .await;
             // Exit at once: a blocking stdin read must not keep the process alive, and the
             // remote code may not fit an ExitCode (Windows).
             std::process::exit(c)
         }
-        other => {
-            let name = match other {
-                Cmd::Run { .. } => "run",
-                Cmd::Mcp { .. } => "mcp",
-                Cmd::Services => "services",
-                Cmd::Up
-                | Cmd::Id
-                | Cmd::Status
-                | Cmd::Reload
-                | Cmd::Pair { .. }
-                | Cmd::Exec { .. } => unreachable!(),
+        Cmd::Run { service, args } => {
+            let req = IpcRequest::Run {
+                device: cli.device,
+                service,
+                args,
             };
-            eprintln!("enishi {name}: not implemented yet");
-            Ok(code(exit::USAGE))
+            std::process::exit(exec::run(&paths, req).await)
         }
+        Cmd::Services => services(&paths, cli.device).await,
+        Cmd::Mcp { target, args } => mcp(paths, cli.device, target, args).await,
     }
+}
+
+async fn services(paths: &Paths, device: Option<String>) -> Result<ExitCode> {
+    let req = IpcRequest::Services { device };
+    match ask(paths, &req, ipc::CLIENT_TIMEOUT).await? {
+        Ok(IpcResponse::Services { device, services }) => {
+            print!("{}", render_services(&device, &services));
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
+        Err(c) => Ok(c),
+    }
+}
+
+fn render_services(device: &str, services: &[ServiceInfo]) -> String {
+    if services.is_empty() {
+        return format!("{device} publishes no services to this device\n");
+    }
+    let w = services
+        .iter()
+        .map(|s| s.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    let mut out = format!("{:<w$}  {:<5}  {:<4}  USE\n", "SERVICE", "KIND", "ARGS");
+    for s in services {
+        let usage = match s.kind {
+            ServiceKind::Mcp => format!("enishi mcp {device}/{}", s.name),
+            ServiceKind::Stdio => format!("enishi -d {device} run {}", s.name),
+        };
+        out.push_str(&format!(
+            "{:<w$}  {:<5}  {:<4}  {usage}\n",
+            s.name,
+            s.kind.as_str(),
+            if s.allow_args { "yes" } else { "no" },
+        ));
+    }
+    out
+}
+
+/// `enishi mcp`: serve stdin/stdout until the client closes stdin. Works without a
+/// running daemon (cache + offline errors), so the device comes from the target, -d, or
+/// `default_peer` read straight from the config file.
+async fn mcp(
+    paths: Paths,
+    device: Option<String>,
+    target: String,
+    args: Vec<String>,
+) -> Result<ExitCode> {
+    let cfg = Config::load(&paths.config_file).ok();
+    let default_peer = cfg.as_ref().and_then(|c| c.device.default_peer.clone());
+    let (device, service) =
+        match enishi_mcp::parse_target(&target, device.as_deref(), default_peer.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("enishi mcp: {e}");
+                return Ok(code(exit::USAGE));
+            }
+        };
+    if let Some(cfg) = &cfg
+        && !cfg.peers.contains_key(&device)
+    {
+        eprintln!(
+            "enishi mcp: no peer named {device:?} in {}",
+            paths.config_file.display()
+        );
+        return Ok(code(exit::USAGE));
+    }
+    let file = enishi_mcp::cache::cache_dir()
+        .map(|d| enishi_mcp::cache::cache_file(&d, &device, &service, &args));
+    let cache = enishi_mcp::Cache::open(file);
+    let label = format!("{device}/{service}");
+    let conn = enishi_mcp::DaemonConnector {
+        paths,
+        device,
+        service,
+        args,
+    };
+    enishi_mcp::run(conn, cache, label, tokio::io::stdin(), tokio::io::stdout()).await?;
+    // stdin is at EOF and replies are flushed; don't wait on runtime teardown.
+    std::process::exit(0)
 }
 
 fn parse_env(s: &str) -> Result<(String, String), String> {
@@ -496,6 +591,51 @@ mod tests {
             r.contains("peers added: a\n") && r.contains("restart"),
             "{r}"
         );
+    }
+
+    #[test]
+    fn service_args() {
+        match Cli::try_parse_from(["enishi", "-d", "pc", "run", "wc", "--", "-l", "x"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Run { service, args } => {
+                assert_eq!(service, "wc");
+                assert_eq!(args, vec!["-l", "x"]);
+            }
+            _ => panic!("not run"),
+        }
+        match Cli::try_parse_from(["enishi", "mcp", "pc/fs"]).unwrap().cmd {
+            Cmd::Mcp { target, args } => {
+                assert_eq!(target, "pc/fs");
+                assert!(args.is_empty());
+            }
+            _ => panic!("not mcp"),
+        }
+        let s = render_services(
+            "pc",
+            &[
+                ServiceInfo {
+                    name: "fs".into(),
+                    kind: ServiceKind::Mcp,
+                    allow_args: false,
+                },
+                ServiceInfo {
+                    name: "wc".into(),
+                    kind: ServiceKind::Stdio,
+                    allow_args: true,
+                },
+            ],
+        );
+        assert!(
+            s.contains("fs       mcp    no    enishi mcp pc/fs\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("wc       stdio  yes   enishi -d pc run wc\n"),
+            "{s}"
+        );
+        assert!(render_services("pc", &[]).contains("no services"));
     }
 
     #[test]

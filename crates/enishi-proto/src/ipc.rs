@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::ExecRequest;
+use crate::session::{ExecRequest, ServiceInfo};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcRequest {
@@ -16,6 +16,15 @@ pub enum IpcRequest {
         device: Option<String>,
         request: ExecRequest,
     },
+    /// Open the service `service` published by `device` (default peer when `None`). Same
+    /// streaming as [`IpcRequest::Exec`]: [`IpcResponse::ExecStarted`], then frames.
+    Run {
+        device: Option<String>,
+        service: String,
+        args: Vec<String>,
+    },
+    /// Services `device` publishes to this device.
+    Services { device: Option<String> },
     /// Create a one-time invite. `name` is the name this device will give the joiner.
     PairInvite { name: Option<String>, ttl_secs: u64 },
     /// Pair with the device that printed `code`; `name` is the local name for it.
@@ -27,7 +36,7 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcResponse {
     Status(StatusReport),
-    /// The peer acknowledged the exec session; stdio frames follow.
+    /// The peer acknowledged the exec or service session; stdio frames follow.
     ExecStarted,
     /// `code` is one of [`crate::exit`].
     Error {
@@ -42,6 +51,11 @@ pub enum IpcResponse {
     },
     Paired(Paired),
     Reloaded(ReloadReport),
+    Services {
+        /// Local name of the peer that was asked.
+        device: String,
+        services: Vec<ServiceInfo>,
+    },
 }
 
 /// A pairing that completed on this device.

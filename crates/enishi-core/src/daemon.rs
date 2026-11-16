@@ -8,7 +8,7 @@
 //! from sleep) reconnects at once with `resume = true` so the peer does the same.
 //!
 //! Next to each ctl connection the daemon keeps a warm `enishi/stream/1` connection to the
-//! same peer, on which exec sessions are opened (see [`crate::session`]).
+//! same peer, on which exec and service sessions are opened (see [`crate::session`]).
 //!
 //! The peer set is live: pairing (`enishi/pair/1`, see [`crate::pairing`]) and
 //! `enishi reload` add, replace and retire peers without a restart.
@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use enishi_proto::{
-    ALPN_CTL, ALPN_PAIR, ALPN_STREAM,
+    ALPN_CTL, ALPN_PAIR, ALPN_STREAM, SessionKind,
     ctl::{CtlRequest, CtlResponse, Hello},
     exit,
     ipc::{IpcRequest, IpcResponse, PeerStatus, Presence, ReloadReport, StatusReport},
@@ -47,6 +47,7 @@ use crate::{
     pair::{InviteBook, hint_addrs},
     pairing,
     paths::Paths,
+    policy::visible_services,
     session, wire,
 };
 
@@ -80,6 +81,8 @@ pub(crate) struct PeerState {
     force_reset: bool,
     /// Warm `enishi/stream/1` connection (ours, outgoing) while online.
     pub(crate) stream: Option<Connection>,
+    /// Our `enishi/ctl/1` connection while online (for requests such as `Services`).
+    pub(crate) ctl: Option<Connection>,
 }
 
 pub(crate) struct Peer {
@@ -118,6 +121,7 @@ impl Peer {
                 remote_instance: None,
                 force_reset: false,
                 stream: None,
+                ctl: None,
             }),
             wake: Notify::new(),
             resume: AtomicBool::new(false),
@@ -342,6 +346,58 @@ impl Shared {
         IpcResponse::Reloaded(report)
     }
 
+    /// `enishi services`: ask the peer which services it publishes to us.
+    async fn list_services(&self, device: Option<String>) -> IpcResponse {
+        let peer = match self.target(device.as_deref()) {
+            Ok(p) => p,
+            Err(message) => {
+                return IpcResponse::Error {
+                    code: exit::USAGE,
+                    message,
+                };
+            }
+        };
+        let conn = {
+            let s = peer.state();
+            match (&s.ctl, s.presence) {
+                (Some(c), Presence::Online) => Some(c.clone()),
+                _ => None,
+            }
+        };
+        let Some(conn) = conn else {
+            return IpcResponse::Error {
+                code: exit::PEER_OFFLINE,
+                message: format!("peer {} is offline", peer.name),
+            };
+        };
+        let error = |message: String| IpcResponse::Error {
+            code: exit::PEER_OFFLINE,
+            message,
+        };
+        match tokio::time::timeout(
+            session::ACK_TIMEOUT,
+            ctl_request(&conn, &CtlRequest::Services),
+        )
+        .await
+        {
+            Ok(Ok(CtlResponse::Services(services))) => IpcResponse::Services {
+                device: peer.name.clone(),
+                services,
+            },
+            Ok(Ok(CtlResponse::Error { message })) => error(format!("{}: {message}", peer.name)),
+            Ok(Ok(other)) => error(format!("{}: unexpected reply {other:?}", peer.name)),
+            Ok(Err(e)) => error(format!(
+                "{}: service list failed (peer too old?): {e:#}",
+                peer.name
+            )),
+            Err(_) => error(format!(
+                "{}: no answer within {:?}",
+                peer.name,
+                session::ACK_TIMEOUT
+            )),
+        }
+    }
+
     fn hello(&self, resume: bool) -> Hello {
         Hello {
             device: self.device.clone(),
@@ -376,12 +432,14 @@ impl Shared {
                 })
             }
             IpcRequest::PairInvite { name, ttl_secs } => self.pair_invite(name, ttl_secs),
-            IpcRequest::Exec { .. } | IpcRequest::PairJoin { .. } | IpcRequest::Reload => {
-                IpcResponse::Error {
-                    code: exit::USAGE,
-                    message: "request needs the async IPC path".into(),
-                }
-            }
+            IpcRequest::Exec { .. }
+            | IpcRequest::Run { .. }
+            | IpcRequest::Services { .. }
+            | IpcRequest::PairJoin { .. }
+            | IpcRequest::Reload => IpcResponse::Error {
+                code: exit::USAGE,
+                message: "request needs the async IPC path".into(),
+            },
         }
     }
 }
@@ -578,7 +636,22 @@ where
         tokio::time::timeout(ipc::CLIENT_TIMEOUT, wire::read_frame(&mut stream)).await??;
     match req {
         IpcRequest::Exec { device, request } => {
-            session::exec_client(sh, stream, device, request).await
+            session::client(sh, stream, device, SessionKind::Exec(request)).await
+        }
+        IpcRequest::Run {
+            device,
+            service,
+            args,
+        } => {
+            let header = SessionKind::Service {
+                name: service,
+                args,
+            };
+            session::client(sh, stream, device, header).await
+        }
+        IpcRequest::Services { device } => {
+            let resp = sh.list_services(device).await;
+            wire::write_frame(&mut stream, &resp).await
         }
         IpcRequest::PairJoin { code, name } => {
             let resp = sh.pair_join(code, name).await;
@@ -672,6 +745,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                     s.force_reset = false;
                     s.last_error = None;
                     s.stream = Some(stream.clone());
+                    s.ctl = Some(conn.clone());
                 }
                 info!(
                     peer = %peer.name,
@@ -691,6 +765,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                 {
                     let mut s = peer.state();
                     s.stream = None;
+                    s.ctl = None;
                     s.presence = Presence::Offline;
                     s.since = Instant::now();
                     s.last_error = Some(why.clone());
@@ -814,6 +889,9 @@ async fn serve_ctl(conn: Connection, sh: Arc<Shared>, peer: Arc<Peer>) {
                         CtlResponse::Hello(sh.hello(false))
                     }
                     CtlRequest::Ping { seq } => CtlResponse::Pong { seq },
+                    CtlRequest::Services => {
+                        CtlResponse::Services(visible_services(&sh.cfg(), &peer.name))
+                    }
                 };
                 wire::write_frame(&mut send, &resp).await?;
                 send.finish()?;
