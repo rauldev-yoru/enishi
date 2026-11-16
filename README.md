@@ -2,76 +2,146 @@
 
 > *enishi* (縁) — the bond that ties people together. Here: the bond between your devices.
 
-**enishi** is a small, native, cross-platform link between your machines (Linux ↔ Windows today, phone later), built so AI agents living on a server can use tools on your other devices as if they were local.
+**enishi** is one small native binary that links your machines peer-to-peer (Linux ↔ Windows
+today; macOS and phone later). Once two devices are paired you can, from either side:
 
-Status: **v0.1 in progress** — daemon, pairing, presence, `exec`, published services and the MCP shim work Linux ↔ Windows; installers are not done yet. Design: [docs/design.md](docs/design.md).
+- **run native commands** on the other one (`enishi exec`), like SSH but without SSH;
+- **use its services**: any stdio program, any MCP server, or any local TCP port (`run`, `mcp`, `forward`);
+- **not care whether it is asleep**: presence is tracked, calls to a sleeping device fail in
+  milliseconds instead of hanging, and everything reconnects on its own when it wakes up.
 
-## Why
+It was built for AI agents that live on a server but need to act on your PC (your real browser,
+your apps, your corporate VPN), and it is just as useful from a plain terminal.
 
-Agents usually live on a server, but much of the useful stuff lives on your PC: native apps, your real browser with your logins, your corporate VPN. Today people bridge that with SSH hops, WSL tricks, or HTTP MCP servers that fall into retry storms the moment the PC sleeps.
+Status: **v0.1 in progress** — link, presence, pairing, `exec`, services, MCP and TCP forwarding
+work and are tested Linux ↔ Windows. Packaging (installers, autostart) is next.
 
-enishi aims to be the base layer that fixes that:
+## What enishi is (and is not)
 
-- **Direct, encrypted, peer-to-peer link** between devices (QUIC via [iroh](https://github.com/n0-computer/iroh)), identity = key, no exposed ports. Works over Tailscale today, standalone later.
-- **Services both ways**: each device publishes stdio services (MCP servers, CLIs); the other side consumes them as local stdio.
-- **Built for devices that sleep**: presence tracking, instant `peer offline` instead of hanging, automatic reconnect, wake hints.
-- **Agent-friendly MCP shim**: cached `initialize` / `tools/list` so agents start fine with the device off, and the handshake is replayed transparently when it comes back.
-- **Runs in the user's session on Windows** (not session 0), so UI-capable tools work.
+| enishi is | enishi is not |
+|---|---|
+| A P2P link between *your* devices: identity by key, encrypted QUIC ([iroh](https://github.com/n0-computer/iroh)), NAT traversal | A VPN for arbitrary traffic |
+| A way to publish and consume services across devices, with per-device permissions | A bundle of MCP servers or tools — you bring your own |
+| Sleep-aware: presence, instant `peer offline`, auto-reconnect, resume hints | An HTTP gateway (no listening HTTP, no exposed debug ports) |
 
-## Usage
+MCP support is a layer on top of the generic service machinery, not the core. On Windows the
+daemon runs in the user's session (not session 0), so UI-capable tools work.
 
-```sh
-enishi up                         # the daemon (systemd --user unit / Windows logon task)
-enishi pair invite                # on one device: prints a one-time code
-enishi pair join <code>           # on the other
-enishi status                     # peers, presence, rtt
-enishi -d pc exec git status      # run a command on the peer (needs `exec = true` there)
-enishi -d pc services             # services the peer publishes to you
-enishi -d pc run sort < list.txt  # raw stdio pipe to a published service
-enishi mcp pc/fs                  # the same, MCP-aware (what agents use)
+## Quick start
+
+```bash
+# on both devices
+enishi up                                  # the daemon (packaging will autostart it)
+
+# device A
+enishi pair invite                         # prints a one-time code (valid 10 min)
+# device B
+enishi pair join enishi1-…                 # both sides now know each other
+enishi status
 ```
 
-enishi ships no services of its own: a device publishes any stdio program it chooses in
-its `enishi.toml`, and only to the peers it names **and** grants:
+A new peer can do **nothing** until you grant it something:
 
-```toml
-[services.fs]
-command = ["node", "C:/…/server-filesystem/dist/index.js", "C:/Users/me/Projects"]
-kind = "mcp"           # mcp | stdio (default) — informational
-allow = ["server"]     # peers that may open it
-allow_args = false     # extra args after `--` are refused unless true
-
-[grants.server]
-services = ["fs"]      # …and the peer must be granted it too
+```bash
+enishi grant server --exec                 # let "server" run commands here
+enishi grant server --service filesystem   # let it use one published service
+enishi grant server --mcp                  # let it start MCP servers here (transparent mode)
 ```
 
-Unknown service → exit `253`, not allowed → `254`, peer offline → `255`.
+## Run commands
 
-Agents point their MCP config at the shim:
+```bash
+enishi exec -- whoami                                   # default device
+enishi -d windows-home exec -- Get-ChildItem C:\Users   # PowerShell by default on Windows
+enishi -d windows-home exec --shell cmd -- ver
+enishi -d server exec --cwd ~/projects -- git status    # from Windows to Linux
+echo data | enishi exec -- wc -c                        # stdin is streamed
+```
+
+stdout/stderr stay separate and the remote exit code becomes enishi's exit code. Flags:
+`--shell`, `--raw` (no shell), `--cwd`, `--env K=V`, `--timeout`. Reserved codes: `255` peer
+offline, `254` not allowed, `253` no such service, `252` local daemon not running.
+
+## Publish services
+
+No need to edit config files by hand — these commands write `enishi.toml` and reload the daemon:
+
+```bash
+enishi service add filesystem --mcp -- npx -y @modelcontextprotocol/server-filesystem C:\Users\me\Projects
+enishi service add sort -- sort                         # any stdio program
+enishi service add web --tcp localhost:3000             # a local TCP port
+enishi service import mcp claude_desktop_config.json    # reuse existing mcpServers configs
+enishi service list
+enishi -d windows-home services                         # what a peer publishes to you
+```
+
+`npx`, `uvx`, `pnpm`… work on Windows exactly as in their docs (`.cmd` shims are resolved safely).
+
+## Use MCP servers from an agent
+
+Two ways, both keep `command: enishi`:
+
+**Transparent** — reads like the original MCP config, just prefixed (needs `enishi grant <peer> --mcp`):
 
 ```yaml
-# any MCP client: Hermes, Claude Code, OpenClaw, ...
-mcp_servers:
-  pc_files:
-    command: enishi
-    args: [mcp, pc/fs]
+command: enishi
+args: [mcp, -d, windows-home, --, npx, -y, "@modelcontextprotocol/server-filesystem", "C:/Users/me/Projects"]
 ```
 
-`enishi mcp` passes JSON-RPC through while the peer is up and caches `initialize` and the
-`*/list` results on disk. When the peer (or even the local daemon) is down it answers
-those from the cache and fails everything else immediately, so agents start fine with
-the PC asleep; when it comes back, the MCP handshake is replayed transparently in the
-same session. Full walkthrough: [docs/examples/filesystem-mcp.md](docs/examples/filesystem-mcp.md).
+**Published** — the device owner decides exactly what is exposed; extra flags after `--` are
+appended only if the service allows it:
 
-## PoC results (Linux server ↔ Windows 11 over LAN)
+```yaml
+command: enishi
+args: [mcp, windows-home/filesystem]
+```
 
-| Metric | Result |
+Get a ready-to-paste snippet for your agent:
+
+```bash
+enishi mcp config windows-home/filesystem --for hermes     # or claude | openclaw | json
+```
+
+While the device sleeps the agent still starts fine: `initialize` and `tools/list` come from a
+local cache, tool calls fail instantly with a clear error, and the session resumes transparently
+when the device is back. Walkthrough: [docs/examples/filesystem-mcp.md](docs/examples/filesystem-mcp.md).
+
+## Forward a TCP port
+
+```bash
+# on the server: publish its local dev server
+enishi service add web --tcp localhost:3000
+# on Windows: open it locally (same port by default)
+enishi -d server forward web           # → http://localhost:3000
+enishi -d server forward web 8080      # → http://localhost:8080
+```
+
+No extra ports are opened on the publishing side and nothing listens beyond loopback by default:
+every TCP connection is a stream inside the one encrypted link. Forwards can also be declared in
+`enishi.toml` (`[forwards.<name>]`) so the daemon keeps them up.
+
+## Security
+
+- Identity is an Ed25519 key per device; only paired keys are accepted.
+- Pairing uses one-time, expiring invites.
+- Everything is denied unless granted per peer: `exec`, transparent `mcp` and each service are
+  separate grants.
+- Every session is written to a local audit log (`audit.jsonl`).
+
+## Measured (Linux server ↔ Windows 11, LAN)
+
+| | |
 |---|---|
-| Warm call (`whoami`) | 10–20 ms (vs ~230 ms SSH→WSL→PowerShell) |
-| MCP `tools/call` | 2–5 ms |
-| Detect sleep | ~2 s |
-| Calls while asleep | ~3 ms `peer offline`, no hangs |
-| Reconnect after wake | ~4.5 s, automatic |
+| `exec whoami` | p50 32 ms (≈4 ms enishi + network, the rest is Windows starting the process) vs 259 ms SSH→WSL |
+| MCP `tools/call` (warm) | ~2 ms |
+| TCP forward, 50 MB | ~110 MB/s Windows ← Linux, sha256 verified |
+| Device goes to sleep | detected in ~3 s; calls meanwhile answer `peer offline` in ~3 ms |
+| Device wakes up | back online ~4 s after wake, no action needed |
+
+## Docs
+
+- [Design](docs/design.md) — layers, protocol, decisions
+- [Example: filesystem MCP on Windows](docs/examples/filesystem-mcp.md)
 
 ## License
 
