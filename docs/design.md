@@ -62,9 +62,10 @@ clashes with real flags, working shell completion). Decided in D1.
 
 | Command | What it does |
 |---|---|
-| `enishi up [--log-file [PATH]]` | Run the daemon (foreground). `--log-file` also writes a size-rotated log (default `enishi.log` in the config dir); the installed unit / task runs `up --log-file`. |
+| `enishi up [--log-file [PATH]]` | Run the daemon (foreground). `--log-file` also writes a size-rotated log (default `enishi.log` in the config dir); the installed unit / task runs `up --log-file`. If another instance holds the IPC endpoint, `up` waits up to 10 s for it to go away when it does not answer (shutting down), and says "already running" only for an instance that keeps answering for 3 s (#12, §5.1). |
 | `enishi install [--prefix DIR] [--name N] [--no-start] [--no-firewall]` / `enishi uninstall [--name N] [--purge --yes] [--no-firewall]` | Per-user install: binary, autostart (systemd user unit / logon task), start; reverse it (§7). |
 | `enishi [-d dev] update [--version vX.Y.Z \| --from-file PATH] [--check] [--status] [--timeout S]` | Update the installed enishi through a detached, rollback-safe updater (§7, D17); with `-d`, ask that device to update itself (its `update` grant, D16) and follow it until it is back. |
+| `enishi restart [--name N]` | Restart the installed daemon (0.1.2, #12): Linux `systemctl --user restart`; Windows stop the task, wait (≤ 10 s) until the installed `enishiw.exe` — matched by its exact path — has exited, else kill it by path, run the task, then wait until the daemon answers over IPC and print its version. Not installed → exit 1. Acts on this machine only (`-d` → use `enishi -d <dev> exec -- enishi restart`). |
 | `enishi logs [-n N] [-f]` | Print / follow the daemon log file. |
 | `enishi firewall [--name N] [--remove \| --check]` | Windows: Private-only inbound rule for enishi (self-elevates: one UAC prompt; `--check` is read-only). |
 | `enishi id` | Print this device's public id. |
@@ -182,6 +183,14 @@ crate `enishi-mcp`, ported from the PoC):
   it runs, cached methods and `ping` are answered at once, other requests are held up
   to 3 s (a quick replay stays invisible) and then fail with "the service is starting".
   A replay that times out or errors drops the session; the next request starts over.
+- Resumable sessions (0.1.2, §5.1, D18): when the link drops, the session is *detached*
+  in the daemons and the same remote process continues after the reconnect — the shim
+  keeps its remote, no handshake replay. While detached, requests already in flight wait
+  for their reply (replayed from the peer's buffer after the resume) up to 30 s after the
+  loss, then fail (a reply that arrives later is dropped, never delivered twice); new
+  requests fail at once like offline (cached methods and `ping` answered). Only when the
+  resume fails (TTL expired, peer restarted, process died) does the session end and the
+  shim fall back to respawn + handshake replay as below.
 - Requests in flight when the remote is lost get an error at once. On stdin EOF the shim
   waits up to 10 s for replies still in flight, then closes the service's stdin.
 - Batches (MCP 2025-03-26) are handled element by element.
@@ -293,6 +302,8 @@ kind = "mcp"                  # mcp | stdio (default) | tcp (with target = "host
 allow = ["server"]            # peer names
 allow_args = false
 startup_timeout = "90s"       # optional (mcp/stdio): 90, "90s", "2m"; shim replay wait
+detach_ttl = "10m"            # optional (mcp/stdio, 0.1.2): keep the process this long after
+                              # the link drops so the session resumes (D18); 0 = old behaviour
 cwd = "~"                     # optional; default: the daemon's
 env = { NODE_ENV = "production" }   # optional
 
@@ -409,6 +420,61 @@ generic session carrier, used for transparent MCP):
 the daemon answers `ExecStarted` (or `Error {code, message}`) and the connection then
 carries the same `ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
 after stdin EOF; closing it means "caller gone".
+
+### 5.1 Resumable sessions (0.1.2, D18)
+
+Problem (#13): a stdio/MCP service session died with the link — the peer killed the
+process tree as soon as the stream broke (e.g. the PC slept), and the shim respawned it on
+reconnect. For stateful servers that loses everything; Playwright MCP `--extension` lost
+the agent's tab and opened a new extension "Welcome" tab on every reconnect.
+
+Protocol (appended variants, so 0.1.1 peers decode everything they did before):
+
+1. A caller that knows the peer is ≥ 0.1.2 opens `SessionKind::Resumable(Box<inner>)` for
+   `Service` and `Mcp` sessions. The peer answers `SessionAck::Resumable {id, token,
+   ttl_ms}` (128-bit random token, compared in constant time) when the session's
+   `detach_ttl` > 0, else plain `Ok`. Older peers get the plain header
+   (`open_session_or`), i.e. the old behaviour. **Exec sessions are never resumable**:
+   they stay killed when the caller is gone — leaving an arbitrary command running
+   unattended on a device that lost its caller is a policy change, not a transport one,
+   and `exec` already has `timeout`/exit semantics built on that.
+2. Both directions are numbered: output frames (`Stdout`/`Stderr`/`Exit`/`Error`) from 0
+   on the peer, input frames (`Stdin`/`StdinEof`) on the caller. `ExecFrame::Ack {seq}`
+   flows both ways (every 16 frames / 250 ms): the peer drops acknowledged output from its
+   replay buffer, the caller drops acknowledged input from its re-send queue (≤ 8 MiB;
+   stdin is back-pressured beyond it).
+3. On link loss the **serving side detaches** instead of killing: the process keeps
+   running, its output goes on into a bounded ring buffer (default 8 MiB,
+   `ENISHI_DETACH_BUFFER_BYTES` for tests) and its stdin is paused. The caller daemon keeps
+   the local client (`enishi run` / `enishi mcp` / transparent MCP) connected, tells it
+   `ExecFrame::Detached {message}` and retries `SessionKind::Resume {id, token, seq,
+   cancel: false}` (every 250 ms once the peer is online) until `ttl + 3 s`.
+4. On `Resume` the peer reattaches the same process, answers
+   `SessionAck::Reattached {input}` (input frames it received) and replays its output
+   from `seq` (frames the caller delivered). The caller re-sends its unacknowledged input
+   after `input` — so a line written while the link was silently dead is neither lost nor
+   duplicated — and tells the client `ExecFrame::Resumed`.
+5. The session ends, process tree killed as before (job object / process group), when:
+   the TTL expires while detached (`expire`); the buffer overflows while detached (`lost`:
+   the output would be incomplete); the caller is gone — local client closed while
+   attached, `Resume {cancel: true}` from a caller whose client left while detached, or a
+   connection closed with code 3/4 (peer removed / caller daemon shutting down: it can
+   never resume). A process that exits while detached stays resumable until its last
+   frames are acknowledged or the TTL expires, so the exit code is not lost.
+6. Resume fails (`Err`: unknown id — expired, peer restarted, process died — or bad
+   token) → the caller ends the session as before (`255`), and the consumer falls back:
+   the MCP shim respawns and replays the handshake; `enishi run` exits 255.
+
+In-flight MCP requests (decided): their replies come from the replay buffer after a
+resume, so a request is executed exactly once and answered once. The shim waits at most
+30 s after the loss for them, then answers with an error (the request may have run) and
+drops the late reply. Requests made while detached fail fast instead of queueing — an
+agent must not hang for the whole TTL. Notifications sent while detached are queued.
+
+`detach_ttl`: per service, else `[device] detach_ttl` (also used for transparent MCP
+sessions), default 10 min, max 24 h, `0` = off. Audit: the caller logs `detach` (reason)
+and `resume` (re-sent input frames); the peer logs `detach`, `resume` (replayed frames,
+time detached), `expire` and `lost` (`event` + `detail` fields), plus the usual end line.
 
 ## 6. Security
 
@@ -688,3 +754,4 @@ builds for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` + `SHA256SUMS
 | **D15** | Packaging is the binary itself: `enishi install/uninstall` per user (systemd user unit / logon scheduled task + user PATH), no admin except the Private-only firewall rule, which install sets automatically with one UAC prompt before the daemon first listens (decline → still works outbound; Linux: offered sudo for firewalld/ufw); idempotent re-install = upgrade; an install record makes uninstall exact. Windows runs a GUI-subsystem copy (`enishiw.exe`) so the daemon never has a console window. The service logs to a 5 MiB-rotated file in the config dir (`enishi logs`). |
 | **D16** | Remote update needs its own grant `[grants.<peer>] update = true` (default deny, `enishi grant <peer> --update`, one `authorize_update`). `exec = true` does not imply it: exec can already run an installer, but `update` is a narrow, audited capability (fixed binary source, checksum, rollback) that a device may want to give a peer that has no shell at all. `update --status` needs the same grant. |
 | **D17** | Updates never run inside the daemon's lifetime: stage 1 verifies and stages, stage 2 is detached (Linux: transient `systemd-run --user` unit, fallback `setsid -f`; Windows: job breakaway checked with `IsProcessInJob`, fallback one-shot scheduled task) and owns stop → swap → start → health check (new version over IPC), rolling back to the backed-up binary and record on any failure after the stop. Progress is a phase timeline in `update.json` (+ `update.log`), which is also what a remote caller polls. |
+| **D18** | Service sessions survive link loss: the serving side detaches (process kept for `detach_ttl`, default 10 min, `0` = off; output into a bounded numbered replay buffer, stdin paused) and the caller daemon resumes the same process with `{id, token, seq}` on reconnect; input/output are acked both ways so nothing is lost or duplicated. Fallback (expired / peer restarted / overflow) is the old respawn + handshake replay. Exec stays non-resumable. The MCP shim keeps in-flight requests up to 30 s and fails new ones fast while detached (§5.1). |
