@@ -43,7 +43,7 @@ pub enum McpCmd {
         /// openclaw (mcp.servers JSON) or json (just the server entry)
         #[arg(long = "for", value_parser = Agent::parse, default_value = "json")]
         agent: Agent,
-        /// Entry name (default: the service, or the package the command runs)
+        /// Entry name (default: <device>-<service>, or <device>-<package> for a command)
         #[arg(long)]
         name: Option<String>,
     },

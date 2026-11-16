@@ -35,7 +35,7 @@ pub fn authorize_exec(policy: &ExecPolicy, _command: &[String]) -> Result<(), &'
 /// `mcp` grant for a peer: may it start arbitrary MCP server commands here with
 /// `enishi mcp -d <this device> -- <command…>` (transparent mode)? Same shape as
 /// [`ExecPolicy`] (`true`/`false` now, `{ allow = [...] }` command rules later), checked
-/// only by [`authorize_mcp`]. Independent of `exec` (design D16).
+/// only by [`authorize_mcp`]. Independent of `exec` (design D13).
 pub type McpPolicy = ExecPolicy;
 
 /// The single check for transparent MCP sessions; the request is then spawned raw.
@@ -245,7 +245,7 @@ services = ["fs"]
     fn mcp_grant_is_separate_from_exec() {
         let c = cfg();
         let argv = vec!["npx".to_string(), "-y".into(), "pkg".into()];
-        // b has exec = true but no mcp grant: denied (D16).
+        // b has exec = true but no mcp grant: denied (D13).
         assert!(authorize_mcp(&c.grant("b").mcp, &argv).is_err());
         assert!(authorize_mcp(&McpPolicy::Flag(true), &argv).is_ok());
         assert!(authorize_mcp(&McpPolicy::Flag(false), &argv).is_err());

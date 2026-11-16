@@ -71,7 +71,14 @@ clashes with real flags, working shell completion). Decided in D1.
 | `enishi shell [-d dev]` | Interactive shell on the peer (PTY / ConPTY). v0.2. |
 | `enishi run [-d dev] <service> [-- args]` | Pipe local stdio to a published service (raw). |
 | `enishi mcp [dev/]<service> [-- extra args]` | Same as `run`, MCP-aware: cached `initialize`/`tools/list`, offline errors, handshake replay. This is what agents put in their config. |
+| `enishi mcp [-d dev] [--cwd D] [--env K=V] -- <command> [args…]` | Transparent mode: run any MCP server command on the peer through the same shim (needs the `mcp` grant, §3.5). |
+| `enishi mcp config <dev/service \| -d dev -- cmd…> --for hermes\|claude\|openclaw\|json` | Print a ready-to-paste config snippet for that agent. |
 | `enishi services [-d dev]` | List services the peer publishes to us. |
+| `enishi forward [-d dev] <service> [local_port] [--bind ip]` | Forward a local TCP port to the peer's `tcp` service until Ctrl-C (§3.6). |
+| `enishi service add <name> [--mcp\|--stdio\|--tcp host:port] [--allow peer]… [--allow-args] [--cwd D] [--env K=V]… [--force] [-- cmd…]` | Publish a local service (edits `enishi.toml`, then reloads the daemon). |
+| `enishi service list` / `enishi service remove <name>` | Local published services (name, kind, args, allow, command/target) / unpublish. |
+| `enishi service import <format> <file> [--allow peer]… [--only a,b] [--dry-run] [--force]` | Publish services from another tool's config; formats are pluggable (`mcp` today, §3.7). |
+| `enishi grant <peer> [--exec\|--no-exec] [--mcp\|--no-mcp] [--service S]… [--revoke-service S]…` | Show or change `[grants.<peer>]`; granting a service also adds the peer to its `allow` (§3.7). |
 | `enishi wake [-d dev]` | Wake-on-LAN through another online peer on the same LAN. v0.2. |
 
 ### 3.3 `exec` details
@@ -166,6 +173,90 @@ crate `enishi-mcp`, ported from the PoC):
   waits up to 10 s for replies still in flight, then closes the service's stdin.
 - Batches (MCP 2025-03-26) are handled element by element.
 
+### 3.5 MCP transparent mode and config snippets
+
+```
+enishi mcp -d pc -- npx -y @modelcontextprotocol/server-filesystem C:\Users\me\Projects
+enishi mcp config pc/fs --for claude
+enishi mcp config -d pc --for hermes -- npx -y @modelcontextprotocol/server-filesystem C:\Users\me
+```
+
+- Transparent mode sends `SessionKind::Mcp(ExecRequest)` (argv, `--cwd`, `--env`) and the
+  peer spawns it **raw** (no shell, no timeout) after `authorize_mcp`; then it is exactly
+  a service session and the shim is the same: cache, offline answers, handshake replay.
+  Cache file: `mcp/<device>/cmd~<fnv1a hex of argv + cwd + env>.json`.
+- Peer side: `[grants.<peer>] mcp = true` (default false). Same shape as `exec`
+  (`McpPolicy` = the `ExecPolicy` enum, `{ allow = [...] }` rules parse but are denied
+  until enforced) with a single `authorize_mcp` check. `exec = true` does **not** imply
+  `mcp` and vice versa (D13).
+- A session the peer refuses (no grant, unknown service) is **not** treated as an outage:
+  the shim answers with an error naming the refusal instead of serving the cache.
+- Programs are resolved on the peer like any raw spawn; on Windows that includes
+  `PATHEXT` so `npx`, `uvx`, `pnpm` (`.cmd` shims) work as written in MCP docs (D12).
+- `enishi mcp config` prints the agent's own format: Hermes → `mcp_servers:` YAML;
+  Claude (Desktop/Code, Cursor) → `{"mcpServers": {…}}`; OpenClaw → `{"mcp":
+  {"servers": {…}}}`; `json` → just the `{command, args, env}` entry. The command is the
+  absolute path of the running `enishi` (agents often start with a minimal `PATH`); a
+  non-default `--config`/`ENISHI_CONFIG` is pinned in `env`. The entry name is
+  `<device>-<service>`, or `<device>-<package>` in transparent mode
+  (`pc-server-filesystem`); `--name` overrides it.
+
+### 3.6 TCP forwarding
+
+```
+pc$     enishi service add web --tcp localhost:3000 --allow server   # publish
+pc$     enishi grant server --service web
+server$ enishi -d pc forward web            # listens on 127.0.0.1:3000 (the target's port)
+server$ enishi -d pc forward web 8080 --bind 0.0.0.0
+```
+
+- A `kind = "tcp"` service has `target = "host:port"` instead of a command; it is
+  double-gated exactly like other services (D9) and `enishi services` reports its port.
+- `forward` asks the **local daemon** to listen (`IpcRequest::Forward`); the listener lives
+  as long as the CLI's IPC connection (Ctrl-C stops it). Default local port = the
+  service's target port (asks the peer, so it must be online; pass a port otherwise);
+  default bind = `127.0.0.1`.
+- Every accepted TCP connection becomes one bi-stream on the warm `enishi/stream/1`
+  connection: header `SessionKind::Tcp {service}`; the peer authorizes, connects to
+  `target` (2.5 s bound) **before** acking (so "connection refused" comes back as an
+  ack error), then raw bytes both ways. Finishing one QUIC direction is a TCP
+  half-close (`shutdown(Write)`) on the other side; an error resets both.
+- Peer offline (or refusal): the connection is accepted and closed at once (fast fail,
+  ≈ ms), with a note on the CLI's stderr / daemon log; the listener keeps going and works
+  again as soon as the peer is back — no restart.
+- Declared forwards, started by the daemon and re-synced on `enishi reload` (changed
+  entries restart, unchanged ones keep running):
+
+  ```toml
+  [forwards.web]
+  peer = "pc"              # default: default_peer
+  service = "web"
+  local_port = 3000        # required here (the peer may be offline at startup)
+  bind = "127.0.0.1"       # default
+  ```
+- Both ends log one line per connection (`forward out` ack/end/bytes, `forward in`
+  connect/end/bytes) and append an audit entry (as a service session).
+
+### 3.7 Managing the config from the CLI
+
+`service add|remove`, `service import` and `grant` edit the local `enishi.toml` with
+`toml_edit` (comments, order and formatting kept), validate the result as a full config
+before writing, and then ask the running daemon to reload (if it is not running the edit
+is kept and the command says so). Duplicates are refused unless `--force`.
+
+- `grant <peer> --service S` writes **both** D9 gates: `S` into `[grants.<peer>]
+  services` and the peer into `[services.S] allow`; `--revoke-service` removes both. D9
+  still holds in the file; the CLI just makes the common case one command (D10).
+- `service import <format> <file>`: importers implement a small trait in `enishi-core`
+  (`Importer { format, description, parse(text) -> ImportSet {services, skipped} }`) and are
+  registered by the binary, so the generic layer knows no format. The only format today
+  is `mcp`, implemented in `enishi-mcp`: the de-facto `mcpServers` JSON (Claude
+  Desktop/Code, Cursor, …; VS Code's top-level `servers` and OpenClaw's `mcp.servers`
+  too) → `{name: {command, args, env, cwd?}}`, imported as `kind = "mcp"`. Entries with
+  a `url` or any `type` other than `stdio` (`http`, `sse`, …) are skipped with a note (remote/HTTP servers are not
+  stdio). Names are sanitized to `[A-Za-z0-9._-]`. Unknown format → error listing the
+  available ones (D11).
+
 ## 4. Configuration
 
 One file per device: `~/.config/enishi/enishi.toml` (Linux) /
@@ -185,7 +276,7 @@ addrs = ["100.71.180.5:7802"] # optional hints (Tailscale/LAN); discovery otherw
 # What this device publishes, and to whom
 [services.fs]
 command = ["node", "C:/…/server-filesystem/dist/index.js", "C:/Users/raulr/Projects"]
-kind = "mcp"                  # mcp | stdio (default)
+kind = "mcp"                  # mcp | stdio (default) | tcp (with target = "host:port")
 allow = ["server"]            # peer names
 allow_args = false
 cwd = "~"                     # optional; default: the daemon's
@@ -193,6 +284,7 @@ env = { NODE_ENV = "production" }   # optional
 
 [grants.server]               # what peer "server" may do on this device
 exec = true                   # run arbitrary commands (off by default)
+mcp = false                   # start arbitrary MCP commands (transparent mode, §3.5)
 services = ["fs", "ps"]
 ```
 
@@ -246,7 +338,9 @@ connection per peer with this ALPN, dialed right after the ctl hello and dropped
 (a close of either marks the peer offline). One bi-stream per session:
 
 1. caller → `SessionKind::Exec(ExecRequest {command, shell, raw, cwd, env, timeout_secs})`
-   or `SessionKind::Service {name, args}` (v0.1 step 5);
+   or `SessionKind::Service {name, args}` (v0.1 step 5), `SessionKind::Mcp(ExecRequest)`
+   (transparent MCP, §3.5) or `SessionKind::Tcp {service}` (one forwarded TCP
+   connection, §3.6: raw bytes after the ack, no `ExecFrame`s);
 2. peer → `SessionAck::Ok` or `SessionAck::Err {code, message}` within **3 s**, after
    authorizing (`authorize_exec` / `authorize_service`) and spawning (so spawn errors come
    back as acks). A service session runs the service's argv + allowed args, raw, with its
@@ -285,7 +379,10 @@ sends it on its own ctl connection, so only an online peer can be asked (`255` o
 
 The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
 per connection (`Status {device}`, `PairInvite`, `PairJoin`, `Reload`,
-`Services {device}`), except `Exec {device, request}` and `Run {device, service, args}`:
+`Services {device}`), except `Forward {device, service, bind, port}` (answers `Forwarding
+{device, service, local}` then streams `Note`s until the CLI closes) and
+`Exec {device, request}`, `Run {device, service, args}` and `Open {device, header}` (a
+generic session carrier, used for transparent MCP):
 the daemon answers `ExecStarted` (or `Error {code, message}`) and the connection then
 carries the same `ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
 after stdin EOF; closing it means "caller gone".
@@ -420,3 +517,8 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | **D7** | Exec authorization, spawn and ack happen before any stdio flows; a spawn failure is an ack error (`126`/`127`), never a half-open session. |
 | **D8** | Pairing is daemon-to-daemon on its own ALPN `enishi/pair/1` with a one-time, TTL-bound, in-memory invite; it adds the peer to each side's config with no grants and hot-applies it. Config edits are applied with an explicit `enishi reload` (no file watcher). |
 | **D9** | Services are double-gated: `[services.S] allow` lists the peer **and** `[grants.<peer>] services` lists `S`; extra args only with `allow_args`. Unknown → `253`, refused → `254`. Services spawn argv directly (no shell) through the exec spawn path. enishi ships no services; the MCP shim is protocol-generic (JSON-RPC framing + handshake only). |
+| **D10** | Config management commands (`service add/remove/import`, `grant`) edit `enishi.toml` with `toml_edit` and then reload the daemon; the file stays the only source of truth. `grant --service` writes both D9 gates in one command (and `--revoke-service` removes both). |
+| **D11** | `service import <format>` uses a pluggable `Importer` registry in the generic layer; each format lives with its domain (`mcp` in `enishi-mcp`). Remote/HTTP MCP entries are skipped with a note, never turned into services. |
+| **D12** | Raw spawns (services, `exec --raw`, transparent MCP) resolve the program on Windows through `PATH` × `PATHEXT` (never the cwd) to a full path; `.cmd`/`.bat` are then launched by Rust std, which since 1.77 runs them via `cmd.exe /e:ON /v:OFF /d /c` with BatBadBut-safe quoting (and refuses args it cannot quote safely). |
+| **D13** | Transparent MCP (`enishi mcp -d dev -- cmd…`) needs its own grant `mcp = true` (`McpPolicy`, same enum as `ExecPolicy`, one `authorize_mcp`). `exec = true` does not imply it: `exec` is for humans/scripts with a shell, `mcp` is what an agent config may trigger unattended; keeping them apart lets a device allow one without the other (and later allowlist MCP packages only). Published services keep working with services grants alone. |
+| **D14** | TCP forwarding: `kind = "tcp"` services (`target`), one QUIC bi-stream per TCP connection on the warm stream connection, connect-before-ack, half-close preserved, fast fail while the peer is offline with the listener kept. Listeners live in the daemon (`enishi forward` holds one for its lifetime; `[forwards.*]` for the daemon's). |
