@@ -17,6 +17,7 @@ use enishi_proto::{
 
 mod exec;
 mod manage;
+mod mcp_cmd;
 
 /// 縁 enishi — a native link between your devices.
 #[derive(Parser)]
@@ -81,17 +82,9 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Expose a remote MCP service as a local stdio MCP server: `enishi mcp windows-home/fs`
-    ///
-    /// Offline-aware: initialize and the list methods are answered from a local cache
-    /// while the device is unreachable (or the local daemon is down), other requests fail
-    /// at once, and the session resumes by itself when the device is back.
-    Mcp {
-        /// <service> or <device>/<service>
-        target: String,
-        #[arg(last = true)]
-        args: Vec<String>,
-    },
+    /// Use a remote MCP server as a local stdio one: `enishi mcp windows/fs`,
+    /// `enishi mcp -d windows -- npx -y <pkg>`, `enishi mcp config … --for <agent>`
+    Mcp(mcp_cmd::McpArgs),
     /// List services the device publishes to us
     Services,
     /// Manage the services this device publishes (edits enishi.toml, then reloads)
@@ -141,7 +134,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn code(c: i32) -> ExitCode {
+pub(crate) fn code(c: i32) -> ExitCode {
     ExitCode::from(c as u8)
 }
 
@@ -200,7 +193,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             std::process::exit(exec::run(&paths, req).await)
         }
         Cmd::Services => services(&paths, cli.device).await,
-        Cmd::Mcp { target, args } => mcp(paths, cli.device, target, args).await,
+        Cmd::Mcp(args) => mcp_cmd::run(paths, cli.config, cli.device, args).await,
         Cmd::Service { action } => manage::service(&paths, action).await,
         Cmd::Grant(args) => manage::grant(&paths, args).await,
     }
@@ -244,50 +237,7 @@ fn render_services(device: &str, services: &[ServiceInfo]) -> String {
     out
 }
 
-/// `enishi mcp`: serve stdin/stdout until the client closes stdin. Works without a
-/// running daemon (cache + offline errors), so the device comes from the target, -d, or
-/// `default_peer` read straight from the config file.
-async fn mcp(
-    paths: Paths,
-    device: Option<String>,
-    target: String,
-    args: Vec<String>,
-) -> Result<ExitCode> {
-    let cfg = Config::load(&paths.config_file).ok();
-    let default_peer = cfg.as_ref().and_then(|c| c.device.default_peer.clone());
-    let (device, service) =
-        match enishi_mcp::parse_target(&target, device.as_deref(), default_peer.as_deref()) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("enishi mcp: {e}");
-                return Ok(code(exit::USAGE));
-            }
-        };
-    if let Some(cfg) = &cfg
-        && !cfg.peers.contains_key(&device)
-    {
-        eprintln!(
-            "enishi mcp: no peer named {device:?} in {}",
-            paths.config_file.display()
-        );
-        return Ok(code(exit::USAGE));
-    }
-    let file = enishi_mcp::cache::cache_dir()
-        .map(|d| enishi_mcp::cache::cache_file(&d, &device, &service, &args));
-    let cache = enishi_mcp::Cache::open(file);
-    let label = format!("{device}/{service}");
-    let conn = enishi_mcp::DaemonConnector {
-        paths,
-        device,
-        service,
-        args,
-    };
-    enishi_mcp::run(conn, cache, label, tokio::io::stdin(), tokio::io::stdout()).await?;
-    // stdin is at EOF and replies are flushed; don't wait on runtime teardown.
-    std::process::exit(0)
-}
-
-fn parse_env(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_env(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
         _ => Err(format!("expected KEY=VALUE, got {s:?}")),
@@ -616,9 +566,9 @@ mod tests {
             _ => panic!("not run"),
         }
         match Cli::try_parse_from(["enishi", "mcp", "pc/fs"]).unwrap().cmd {
-            Cmd::Mcp { target, args } => {
-                assert_eq!(target, "pc/fs");
-                assert!(args.is_empty());
+            Cmd::Mcp(a) => {
+                assert_eq!(a.spec.target.as_deref(), Some("pc/fs"));
+                assert!(a.spec.args.is_empty() && a.action.is_none());
             }
             _ => panic!("not mcp"),
         }

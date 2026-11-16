@@ -81,6 +81,9 @@ struct Shim<C> {
     replays: u64,
     /// Why we are offline (for client errors); last state logged on stderr.
     reason: String,
+    /// The device answered but refused the session (grant/allow/unknown service): not
+    /// an outage, so the client is told to fix permissions rather than wait.
+    refused: bool,
     logged: Option<String>,
 }
 
@@ -157,6 +160,7 @@ where
         init_req: None,
         replays: 0,
         reason: "not connected yet".into(),
+        refused: false,
         logged: None,
     };
     let mut lines = BufReader::new(input).lines();
@@ -264,6 +268,13 @@ impl<C: Connector> Shim<C> {
         let reply = match cached {
             Some(r) => result(id, r),
             None if method == "ping" => result(id, json!({})),
+            None if self.refused => error(
+                id,
+                format!(
+                    "enishi: {} refused the session ({}); check the name and the device's grants",
+                    self.label, self.reason
+                ),
+            ),
             None => error(
                 id,
                 format!(
@@ -282,13 +293,18 @@ impl<C: Connector> Shim<C> {
             Ok(r) => r,
             Err(e) => {
                 self.reason = e.message.clone();
+                self.refused = matches!(
+                    e.code,
+                    enishi_proto::exit::NOT_ALLOWED | enishi_proto::exit::NO_SUCH_SERVICE
+                );
+                let word = if self.refused { "refused" } else { "offline" };
                 let hint = if self.cache.get("initialize").is_some() {
                     "answering from cache"
                 } else {
                     "no cached handshake yet"
                 };
-                let state = format!("offline {}", e.code);
-                self.note(&state, format!("offline: {} ({hint})", e.message));
+                let state = format!("{word} {}", e.code);
+                self.note(&state, format!("{word}: {} ({hint})", e.message));
                 return false;
             }
         };
@@ -299,6 +315,7 @@ impl<C: Connector> Shim<C> {
             return false;
         }
         self.link = Some(remote);
+        self.refused = false;
         let text = if replay {
             "online (handshake replayed)"
         } else {

@@ -12,9 +12,10 @@ pub mod cache;
 pub mod daemon;
 pub mod import;
 pub mod shim;
+pub mod snippet;
 
 pub use cache::Cache;
-pub use daemon::DaemonConnector;
+pub use daemon::{DaemonConnector, Target};
 pub use shim::{Connector, OpenError, Remote, run};
 
 /// Map an `enishi mcp` target to `(device, service)`: `dev/service` or just `service`

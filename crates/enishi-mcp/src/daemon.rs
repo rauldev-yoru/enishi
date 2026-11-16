@@ -1,12 +1,13 @@
 //! The real [`Connector`]: each open is an `enishi run`-style session through the local
-//! daemon (`IpcRequest::Run`), with stdout split into JSON-RPC lines and the service's
-//! stderr copied to ours (agents log the shim's stderr).
+//! daemon (`IpcRequest::Run` for a published service, `IpcRequest::Open` with
+//! `SessionKind::Mcp` for a transparent-mode command), with stdout split into JSON-RPC
+//! lines and the service's stderr copied to ours (agents log the shim's stderr).
 
 use enishi_core::{ipc, paths::Paths, wire};
 use enishi_proto::{
     exit,
     ipc::IpcRequest,
-    session::{ExecFrame, MAX_CHUNK},
+    session::{ExecFrame, ExecRequest, MAX_CHUNK, SessionKind},
 };
 use serde_json::Value;
 use tokio::{io::AsyncWriteExt, sync::mpsc};
@@ -19,16 +20,41 @@ const MAX_LINE: usize = 64 << 20;
 pub struct DaemonConnector {
     pub paths: Paths,
     pub device: String,
-    pub service: String,
-    pub args: Vec<String>,
+    pub target: Target,
+}
+
+/// What to open on the device.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// A published `kind = "mcp"` service; `args` only if it has `allow_args`.
+    Service { name: String, args: Vec<String> },
+    /// Transparent mode: any MCP server command (needs the peer's `mcp` grant).
+    Command(ExecRequest),
+}
+
+impl Target {
+    /// `fs` or `npx -y pkg…` for log lines.
+    pub fn label(&self) -> String {
+        match self {
+            Target::Service { name, .. } => name.clone(),
+            Target::Command(r) => r.command.join(" "),
+        }
+    }
 }
 
 impl Connector for DaemonConnector {
     async fn open(&self) -> Result<Remote, OpenError> {
-        let req = IpcRequest::Run {
-            device: Some(self.device.clone()),
-            service: self.service.clone(),
-            args: self.args.clone(),
+        let device = Some(self.device.clone());
+        let req = match &self.target {
+            Target::Service { name, args } => IpcRequest::Run {
+                device,
+                service: name.clone(),
+                args: args.clone(),
+            },
+            Target::Command(r) => IpcRequest::Open {
+                device,
+                header: SessionKind::Mcp(r.clone()),
+            },
         };
         let stream = ipc::open_session(&self.paths, &req)
             .await
@@ -44,7 +70,7 @@ impl Connector for DaemonConnector {
         let (to_remote, mut to_remote_rx) = mpsc::channel::<Value>(64);
         let (from_remote_tx, from_remote) = mpsc::channel::<Value>(64);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        let label = format!("{}/{}", self.device, self.service);
+        let label = format!("{}/{}", self.device, self.target.label());
 
         // Shim → service stdin. After the shim drops its sender: stdin EOF, but the IPC
         // write half stays open until the session ends (closing it = caller gone = kill).

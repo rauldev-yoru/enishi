@@ -3,7 +3,8 @@
 //!
 //! Location: `$ENISHI_CACHE_DIR`, else `%LOCALAPPDATA%\enishi\cache` (Windows) or
 //! `$XDG_CACHE_HOME/enishi` / `~/.cache/enishi` (elsewhere); file
-//! `mcp/<device>/<service>[.<args hash>].json`.
+//! `mcp/<device>/<service>[.<args hash>].json`, or `mcp/<device>/cmd~<argv hash>.json`
+//! for transparent mode (`enishi mcp -d dev -- cmd…`; `~` never appears in service names).
 
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,26 @@ pub fn cache_file(base: &Path, device: &str, service: &str, args: &[String]) -> 
         name.push_str(&format!(".{:016x}", fnv1a(args.join("\0").as_bytes())));
     }
     name.push_str(".json");
+    base.join("mcp").join(component(device)).join(name)
+}
+
+/// Cache file for the transparent-mode command `argv` on `device` (cwd and env are part
+/// of the key too: they can change what the server exposes).
+pub fn command_cache_file(
+    base: &Path,
+    device: &str,
+    argv: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> PathBuf {
+    let mut key = argv.join("\0");
+    if let Some(c) = cwd {
+        key.push_str(&format!("\0cwd={c}"));
+    }
+    for (k, v) in env {
+        key.push_str(&format!("\0env={k}={v}"));
+    }
+    let name = format!("cmd~{:016x}.json", fnv1a(key.as_bytes()));
     base.join("mcp").join(component(device)).join(name)
 }
 
@@ -143,6 +164,45 @@ mod tests {
             cache_file(b, "..", "a/b", &[]),
             Path::new("/c/mcp/_../a_b.json")
         );
+    }
+
+    #[test]
+    fn command_file_names() {
+        let b = Path::new("/c");
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let f = command_cache_file(b, "pc", &argv(&["npx", "-y", "x"]), None, &[]);
+        assert!(f.starts_with("/c/mcp/pc"));
+        let name = f.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("cmd~") && name.ends_with(".json"),
+            "{name}"
+        );
+        assert_eq!(
+            f,
+            command_cache_file(b, "pc", &argv(&["npx", "-y", "x"]), None, &[])
+        );
+        assert_ne!(
+            f,
+            command_cache_file(b, "pc", &argv(&["npx", "-y", "y"]), None, &[])
+        );
+        assert_ne!(
+            f,
+            command_cache_file(b, "pc", &argv(&["npx -y", "x"]), None, &[])
+        );
+        assert_ne!(
+            f,
+            command_cache_file(b, "pc", &argv(&["npx", "-y", "x"]), Some("/"), &[])
+        );
+        assert_ne!(
+            f,
+            command_cache_file(b, "lap", &argv(&["npx", "-y", "x"]), None, &[])
+        );
+        let env = [("K".to_string(), "v".to_string())];
+        assert_ne!(
+            f,
+            command_cache_file(b, "pc", &argv(&["npx", "-y", "x"]), None, &env)
+        );
+        assert_ne!(f, cache_file(b, "pc", "cmd", &argv(&["npx", "-y", "x"])));
     }
 
     #[test]
