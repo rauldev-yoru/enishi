@@ -50,6 +50,11 @@ pub struct DeviceConfig {
     /// Fixed UDP port; helps direct dialing and firewall rules. Random when absent.
     #[serde(default)]
     pub listen_port: Option<u16>,
+    /// Default `detach_ttl` (design D18) for the stdio/mcp services this device publishes
+    /// and for transparent-mode MCP sessions peers open here. Default
+    /// [`DEFAULT_DETACH_TTL`]; `0` = sessions die with the link (the pre-0.1.2 behaviour).
+    #[serde(default, deserialize_with = "opt_ttl")]
+    pub detach_ttl: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +104,11 @@ pub struct ServiceConfig {
     /// their own `--startup-timeout` is given.
     #[serde(default, deserialize_with = "opt_duration")]
     pub startup_timeout: Option<std::time::Duration>,
+    /// How long the service's process outlives a lost link, waiting for the consumer to
+    /// resume the session (design D18). Default: `[device] detach_ttl`, else
+    /// [`DEFAULT_DETACH_TTL`]; `0` = killed with the link.
+    #[serde(default, deserialize_with = "opt_ttl")]
+    pub detach_ttl: Option<std::time::Duration>,
 }
 
 impl ServiceConfig {
@@ -141,9 +151,31 @@ pub struct Grant {
 /// Longest accepted `startup_timeout`.
 pub const MAX_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// How long a detached session's process is kept by default (design D18).
+pub const DEFAULT_DETACH_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Longest accepted `detach_ttl`.
+pub const MAX_DETACH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// A `detach_ttl`: like [`parse_duration`], but `0` (off) is allowed and the bound is
+/// [`MAX_DETACH_TTL`].
+pub fn parse_ttl(s: &str) -> std::result::Result<std::time::Duration, String> {
+    if s.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic()) == "0" {
+        return Ok(std::time::Duration::ZERO);
+    }
+    let d = parse_duration_max(s, MAX_DETACH_TTL)?;
+    Ok(d)
+}
+
 /// A duration as plain seconds (`90`) or with a unit: `500ms`, `90s`, `2m`, `1h`.
 /// Must be non-zero and at most [`MAX_STARTUP_TIMEOUT`].
 pub fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
+    parse_duration_max(s, MAX_STARTUP_TIMEOUT)
+}
+
+fn parse_duration_max(
+    s: &str,
+    max: std::time::Duration,
+) -> std::result::Result<std::time::Duration, String> {
     use std::time::Duration;
     let s = s.trim();
     let (num, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
@@ -160,8 +192,12 @@ pub fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, Strin
         "h" => Duration::from_secs(n.saturating_mul(3600)),
         _ => return Err(format!("invalid duration {s:?}: units are ms, s, m, h")),
     };
-    if d.is_zero() || d > MAX_STARTUP_TIMEOUT {
-        return Err(format!("duration {s:?} must be between 1ms and 1h"));
+    if d.is_zero() || d > max {
+        let max = match max.as_secs() {
+            h if h % 3600 == 0 => format!("{}h", h / 3600),
+            s => format!("{s}s"),
+        };
+        return Err(format!("duration {s:?} must be between 1ms and {max}"));
     }
     Ok(d)
 }
@@ -182,6 +218,20 @@ fn opt_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<std::time::Dur
         .map_err(serde::de::Error::custom)
 }
 
+fn opt_ttl<'de, D: Deserializer<'de>>(d: D) -> Result<Option<std::time::Duration>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Secs(u64),
+        Text(String),
+    }
+    let text = match Raw::deserialize(d)? {
+        Raw::Secs(n) => n.to_string(),
+        Raw::Text(t) => t,
+    };
+    parse_ttl(&text).map(Some).map_err(serde::de::Error::custom)
+}
+
 fn endpoint_id<'de, D: Deserializer<'de>>(d: D) -> Result<EndpointId, D::Error> {
     let s = String::deserialize(d)?;
     EndpointId::from_str(s.trim())
@@ -199,6 +249,16 @@ impl FromStr for Config {
 }
 
 impl Config {
+    /// How long a session of `service` (a transparent MCP session when `None`) outlives
+    /// a lost link (design D18); zero = not resumable.
+    pub fn detach_ttl(&self, service: Option<&str>) -> std::time::Duration {
+        service
+            .and_then(|s| self.services.get(s))
+            .and_then(|s| s.detach_ttl)
+            .or(self.device.detach_ttl)
+            .unwrap_or(DEFAULT_DETACH_TTL)
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -233,6 +293,9 @@ impl Config {
             if svc.kind == ServiceKind::Tcp {
                 if svc.startup_timeout.is_some() {
                     bail!("service {name:?}: startup_timeout is for stdio/mcp services");
+                }
+                if svc.detach_ttl.is_some() {
+                    bail!("service {name:?}: detach_ttl is for stdio/mcp services");
                 }
                 let Some(t) = &svc.target else {
                     bail!("service {name:?}: kind = \"tcp\" needs target = \"host:port\"");
@@ -596,6 +659,41 @@ exec = {{ allow = ["git *"], deny = ["rm *"] }}
         assert_eq!(none.services["fs"].startup_timeout, None);
         let tcp = "[device]\nname = \"x\"\n[services.w]\nkind = \"tcp\"\ntarget = \"h:1\"\nstartup_timeout = 5\n";
         assert!(err(tcp).contains("startup_timeout"));
+    }
+
+    #[test]
+    fn detach_ttl() {
+        use std::time::Duration;
+        let get = |dev: &str, svc: &str| {
+            format!("[device]\nname = \"x\"\n{dev}[services.fs]\ncommand = [\"a\"]\n{svc}")
+                .parse::<Config>()
+                .map(|c| {
+                    (
+                        c.device.detach_ttl,
+                        c.services["fs"].detach_ttl,
+                        c.detach_ttl(Some("fs")),
+                    )
+                })
+        };
+        assert_eq!(get("", "").unwrap(), (None, None, DEFAULT_DETACH_TTL));
+        assert_eq!(
+            get("", "detach_ttl = 0\n").unwrap(),
+            (None, Some(Duration::ZERO), Duration::ZERO)
+        );
+        assert_eq!(get("", "detach_ttl = \"0s\"\n").unwrap().2, Duration::ZERO);
+        assert_eq!(
+            get("detach_ttl = \"2h\"\n", "").unwrap().2,
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            get("detach_ttl = \"2h\"\n", "detach_ttl = 30\n").unwrap().2,
+            Duration::from_secs(30)
+        );
+        for bad in ["\"25h\"", "\"soon\"", "-1"] {
+            assert!(get("", &format!("detach_ttl = {bad}\n")).is_err(), "{bad}");
+        }
+        let tcp = "[device]\nname = \"x\"\n[services.w]\nkind = \"tcp\"\ntarget = \"h:1\"\ndetach_ttl = 5\n";
+        assert!(err(tcp).contains("detach_ttl"));
     }
 
     #[test]

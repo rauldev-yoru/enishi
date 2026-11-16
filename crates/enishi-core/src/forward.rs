@@ -275,6 +275,9 @@ async fn tunnel(
         Ok(Ok((_, _, SessionAck::Err { message, .. }))) => {
             return fail(&peer.name, format!("{} refused: {message}", peer.name));
         }
+        Ok(Ok((_, _, other))) => {
+            return fail(&peer.name, format!("unexpected answer {other:?}"));
+        }
         Ok(Err(e)) => return fail(&peer.name, format!("session failed: {e:#}")),
         Err(_) => return fail(&peer.name, "peer did not acknowledge in time".into()),
     };

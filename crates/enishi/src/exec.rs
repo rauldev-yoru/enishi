@@ -3,7 +3,7 @@
 
 use enishi_core::{ipc, paths::Paths, wire};
 use enishi_proto::{
-    exit,
+    SessionKind, exit,
     ipc::IpcRequest,
     session::{ExecFrame, MAX_CHUNK},
 };
@@ -32,7 +32,25 @@ pub async fn run(paths: &Paths, req: IpcRequest) -> i32 {
 }
 
 async fn session(paths: &Paths, req: IpcRequest) -> Result<i32, (i32, String)> {
-    let stream = ipc::open_session(paths, &req).await?;
+    let stream = match &req {
+        // A published service: resumable (design D18) when the daemon is ≥ 0.1.2.
+        IpcRequest::Run {
+            device,
+            service,
+            args,
+        } => {
+            let header = SessionKind::Resumable(Box::new(SessionKind::Service {
+                name: service.clone(),
+                args: args.clone(),
+            }));
+            let open = IpcRequest::Open {
+                device: device.clone(),
+                header,
+            };
+            ipc::open_session_or(paths, &open, &req).await?
+        }
+        _ => ipc::open_session(paths, &req).await?,
+    };
     let lost = |e: anyhow::Error| (exit::DAEMON_DOWN, format!("daemon connection lost: {e:#}"));
     let (mut r, mut w) = tokio::io::split(stream);
     // stdin → daemon. The write half stays open after EOF: closing the connection would
@@ -68,6 +86,8 @@ async fn session(paths: &Paths, req: IpcRequest) -> Result<i32, (i32, String)> {
             Ok(ExecFrame::Stderr(b)) => put(&mut stderr, &b).await,
             Ok(ExecFrame::Exit { code }) => break Ok(code),
             Ok(ExecFrame::Error { code, message }) => break Err((code, message)),
+            Ok(ExecFrame::Detached { message }) => eprintln!("enishi: {message}"),
+            Ok(ExecFrame::Resumed) => eprintln!("enishi: session resumed"),
             Ok(other) => break Err((exit::DAEMON_DOWN, format!("unexpected frame {other:?}"))),
             Err(e) => break Err(lost(e)),
         }

@@ -85,6 +85,8 @@ pub(crate) struct PeerState {
     last_error: Option<String>,
     /// `instance` from the hello on our current outgoing connection.
     remote_instance: Option<u64>,
+    /// `version` from that hello (decides whether sessions can be resumable, D18).
+    pub(crate) remote_version: Option<String>,
     /// Set when the current connection must be dropped (peer restarted / resumed).
     force_reset: bool,
     /// Warm `enishi/stream/1` connection (ours, outgoing) while online.
@@ -127,6 +129,7 @@ impl Peer {
                 rtt: None,
                 last_error: None,
                 remote_instance: None,
+                remote_version: None,
                 force_reset: false,
                 stream: None,
                 ctl: None,
@@ -245,6 +248,8 @@ pub(crate) struct Shared {
     /// Incoming peer connections being served, by `stable_id` (closed on shutdown).
     incoming: Mutex<HashMap<usize, Connection>>,
     hooks: Hooks,
+    /// Resumable sessions served here (design D18).
+    pub(crate) detached: crate::detach::Registry,
 }
 
 impl Shared {
@@ -832,6 +837,7 @@ pub async fn run_with(cfg: Config, paths: Paths, key: SecretKey, hooks: Hooks) -
         forwards: Mutex::new(HashMap::new()),
         incoming: Mutex::new(HashMap::new()),
         hooks,
+        detached: Default::default(),
     });
     let n_peers = cfg.peers.len();
     // Starts a supervisor per peer and fills the allow-list.
@@ -894,7 +900,7 @@ pub async fn run_with(cfg: Config, paths: Paths, key: SecretKey, hooks: Hooks) -
 /// One CLI connection: a single request, or an exec session that streams.
 async fn serve_ipc<S>(sh: Arc<Shared>, mut stream: S) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let req: IpcRequest =
         tokio::time::timeout(ipc::CLIENT_TIMEOUT, wire::read_frame(&mut stream)).await??;
@@ -1033,6 +1039,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                     s.since = Instant::now();
                     s.last_seen = Some(Instant::now());
                     s.remote_instance = Some(hello.instance);
+                    s.remote_version = Some(hello.version.clone());
                     s.force_reset = false;
                     s.last_error = None;
                     s.stream = Some(stream.clone());

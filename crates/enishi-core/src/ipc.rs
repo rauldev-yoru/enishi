@@ -66,6 +66,25 @@ pub async fn open_session(paths: &Paths, req: &IpcRequest) -> Result<ClientStrea
     }
 }
 
+/// [`open_session`] for a resumable session (`SessionKind::Resumable`, design D18),
+/// falling back to `legacy` when the daemon predates 0.1.2 (it drops the connection on
+/// the unknown header).
+pub async fn open_session_or(
+    paths: &Paths,
+    req: &IpcRequest,
+    legacy: &IpcRequest,
+) -> Result<ClientStream, (i32, String)> {
+    match open_session(paths, req).await {
+        Err((code, m))
+            if code == enishi_proto::exit::DAEMON_DOWN
+                && m.starts_with("daemon connection lost") =>
+        {
+            open_session(paths, legacy).await
+        }
+        r => r,
+    }
+}
+
 /// Send one request to the local daemon.
 pub async fn request(paths: &Paths, req: &IpcRequest) -> Result<IpcResponse, ClientError> {
     request_timeout(paths, req, CLIENT_TIMEOUT).await

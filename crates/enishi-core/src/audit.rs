@@ -55,6 +55,16 @@ pub struct Entry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'a str>,
     pub duration_ms: u64,
+    /// Resumable sessions (design D18): `detach`, `resume`, `expire` or `lost` lines in
+    /// the middle of a session (the session's final line has no event).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<&'a str>,
+    /// What an event line is about (`write failed: …`, `replayed 3 frames after 41.2s`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<&'a str>,
+    /// Id of a resumable session (links its event lines and final line).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
 }
 
 impl<'a> Entry<'a> {
@@ -74,6 +84,9 @@ impl<'a> Entry<'a> {
             exit: None,
             error: None,
             duration_ms: 0,
+            event: None,
+            detail: None,
+            session: None,
         }
     }
 
@@ -100,6 +113,9 @@ impl<'a> Entry<'a> {
             exit: None,
             error: None,
             duration_ms: 0,
+            event: None,
+            detail: None,
+            session: None,
         }
     }
 
@@ -110,6 +126,19 @@ impl<'a> Entry<'a> {
             service: None,
             ..Entry::service(dir, peer, "", cmd)
         }
+    }
+
+    /// Tag the line with a resumable session's id (`None`: unchanged).
+    pub fn session(mut self, id: Option<u64>) -> Self {
+        self.session = id;
+        self
+    }
+
+    /// A mid-session event line (`detach`, `resume`, `expire`, `lost`).
+    pub fn event(mut self, event: &'a str, detail: Option<&'a str>) -> Self {
+        self.event = Some(event);
+        self.detail = detail;
+        self
     }
 
     pub fn finish(mut self, exit: Option<i32>, error: Option<&'a str>, took: Duration) -> Self {

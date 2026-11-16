@@ -88,6 +88,21 @@ pub enum SessionKind {
     Tcp {
         service: String,
     },
+    /// A resumable session (added in 0.1.2, design D18): `Service` or `Mcp` whose process
+    /// outlives a link loss for the service's `detach_ttl`. The peer answers
+    /// [`SessionAck::Resumable`] (or plain `Ok` when it does not keep this one).
+    /// Exec sessions are never resumable. Only sent to peers ≥ 0.1.2.
+    Resumable(Box<SessionKind>),
+    /// Reattach the resumable session `id` after a link loss: the peer answers
+    /// [`SessionAck::Ok`] and replays its output from frame `seq` (the number of output
+    /// frames the caller delivered), or `Err` when the session is gone. With `cancel` the
+    /// peer kills the session instead (the caller went away while detached).
+    Resume {
+        id: u64,
+        token: u128,
+        seq: u64,
+        cancel: bool,
+    },
 }
 
 /// The peer's answer to a [`SessionKind`] header.
@@ -98,6 +113,19 @@ pub enum SessionAck {
     Err {
         code: i32,
         message: String,
+    },
+    /// The session started and survives link losses for `ttl_ms`: reattach with
+    /// [`SessionKind::Resume`] and this `id`/`token`.
+    Resumable {
+        id: u64,
+        token: u128,
+        ttl_ms: u64,
+    },
+    /// Answer to a successful [`SessionKind::Resume`]: the session is reattached on this
+    /// stream; `input` is how many input frames (`Stdin` + `StdinEof`) the peer received
+    /// so far, so the caller re-sends exactly the ones after it (never one twice).
+    Reattached {
+        input: u64,
     },
 }
 
@@ -119,6 +147,33 @@ pub enum ExecFrame {
         code: i32,
         message: String,
     },
+    /// Resumable sessions only. Caller → peer: output frames up to `seq` (count since the
+    /// start) were delivered and may be dropped from the replay buffer. Peer → caller: input
+    /// frames up to `seq` were received, the caller may drop its copies.
+    Ack {
+        seq: u64,
+    },
+    /// Daemon → local client of a resumable session: the link was lost, the remote
+    /// process is kept alive; stdin is paused until [`ExecFrame::Resumed`] (or the
+    /// session ends with `Error`).
+    Detached {
+        message: String,
+    },
+    /// Daemon → local client: the session was reattached, the same process continues.
+    Resumed,
+}
+
+impl ExecFrame {
+    /// Frames that count in a resumable session's output sequence (peer → caller).
+    pub fn is_output(&self) -> bool {
+        matches!(
+            self,
+            ExecFrame::Stdout(_)
+                | ExecFrame::Stderr(_)
+                | ExecFrame::Exit { .. }
+                | ExecFrame::Error { .. }
+        )
+    }
 }
 
 impl std::fmt::Debug for ExecFrame {
@@ -130,6 +185,9 @@ impl std::fmt::Debug for ExecFrame {
             ExecFrame::Stderr(b) => write!(f, "Stderr({} bytes)", b.len()),
             ExecFrame::Exit { code } => write!(f, "Exit({code})"),
             ExecFrame::Error { code, message } => write!(f, "Error({code}, {message:?})"),
+            ExecFrame::Ack { seq } => write!(f, "Ack({seq})"),
+            ExecFrame::Detached { message } => write!(f, "Detached({message:?})"),
+            ExecFrame::Resumed => write!(f, "Resumed"),
         }
     }
 }
@@ -219,9 +277,42 @@ mod tests {
                 code: crate::exit::TIMED_OUT,
                 message: "t".into(),
             },
+            ExecFrame::Ack { seq: u64::MAX },
+            ExecFrame::Detached {
+                message: "link lost".into(),
+            },
+            ExecFrame::Resumed,
         ] {
             rt(f);
         }
+    }
+
+    #[test]
+    fn resumable_variants_roundtrip_and_keep_old_encodings() {
+        let svc = SessionKind::Service {
+            name: "pw".into(),
+            args: vec![],
+        };
+        rt(SessionKind::Resumable(Box::new(svc.clone())));
+        rt(SessionKind::Resume {
+            id: 7,
+            token: u128::MAX - 3,
+            seq: 42,
+            cancel: false,
+        });
+        rt(SessionAck::Resumable {
+            id: 1,
+            token: 99,
+            ttl_ms: 600_000,
+        });
+        rt(SessionAck::Reattached { input: 3 });
+        // Appended variants: what 0.1.1 peers send and decode is unchanged.
+        assert_eq!(encode(&SessionAck::Ok).unwrap()[HEADER_LEN..], [0u8]);
+        assert_eq!(encode(&svc).unwrap()[HEADER_LEN], 1);
+        assert_eq!(encode(&ExecFrame::StdinEof).unwrap()[HEADER_LEN..], [1u8]);
+        assert!(ExecFrame::Exit { code: 0 }.is_output());
+        assert!(!ExecFrame::Ack { seq: 1 }.is_output());
+        assert!(!ExecFrame::Resumed.is_output());
     }
 
     #[test]
