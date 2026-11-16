@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::{Duration, Instant, timeout},
 };
 
@@ -23,6 +23,10 @@ struct FakeState {
     init_delay: Duration,
     /// What [`Connector::startup_timeout`] reports (the service's setting).
     startup_timeout: Option<Duration>,
+    /// D18: link state of the current remote, and a gate holding the server's input
+    /// (what a parked session looks like from the shim).
+    detached: Option<watch::Sender<Option<Instant>>>,
+    hold: Option<watch::Sender<bool>>,
 }
 
 #[derive(Clone, Default)]
@@ -40,6 +44,17 @@ impl Fake {
         let mut s = self.0.lock().unwrap();
         s.init_delay = delay;
         s.startup_timeout = timeout;
+    }
+    fn set_detached(&self, on: bool) {
+        let s = self.0.lock().unwrap();
+        s.detached
+            .as_ref()
+            .unwrap()
+            .send_replace(on.then(Instant::now));
+    }
+    fn set_hold(&self, on: bool) {
+        let s = self.0.lock().unwrap();
+        s.hold.as_ref().unwrap().send_replace(on);
     }
     fn opens(&self) -> usize {
         self.0.lock().unwrap().opens
@@ -63,6 +78,8 @@ impl Connector for Fake {
         let (tx, mut srv_rx) = mpsc::channel::<Value>(16);
         let (srv_tx, rx) = mpsc::channel::<Value>(16);
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
+        let (det_tx, detached) = watch::channel(None);
+        let (hold_tx, mut hold) = watch::channel(false);
         {
             let mut s = self.0.lock().unwrap();
             if !s.online {
@@ -73,6 +90,8 @@ impl Connector for Fake {
             }
             s.opens += 1;
             s.kill = Some(kill_tx);
+            s.detached = Some(det_tx);
+            s.hold = Some(hold_tx);
         }
         let state = self.0.clone();
         let gen_ = self.opens();
@@ -85,6 +104,11 @@ impl Connector for Fake {
                     _ = &mut kill_rx => break,
                     m = srv_rx.recv() => match m { Some(m) => m, None => break },
                 };
+                while *hold.borrow() {
+                    if hold.changed().await.is_err() {
+                        break;
+                    }
+                }
                 state.lock().unwrap().seen.push(msg.clone());
                 let (Some(method), Some(id)) = (msg["method"].as_str(), msg.get("id")) else {
                     continue;
@@ -120,7 +144,7 @@ impl Connector for Fake {
                 }
             }
         });
-        Ok(Remote { tx, rx })
+        Ok(Remote { tx, rx, detached })
     }
 }
 
@@ -150,7 +174,10 @@ impl Client {
         self.stdin.as_mut().unwrap().write_all(&line).await.unwrap();
     }
     async fn recv(&mut self) -> Value {
-        let l = timeout(Duration::from_secs(5), self.stdout.next_line())
+        self.recv_within(Duration::from_secs(5)).await
+    }
+    async fn recv_within(&mut self, d: Duration) -> Value {
+        let l = timeout(d, self.stdout.next_line())
             .await
             .expect("reply in time")
             .unwrap()
@@ -496,4 +523,77 @@ async fn replay_gives_up_after_service_startup_timeout() {
     assert_eq!(r["result"]["content"][0]["text"], "y", "{r}");
     c.close().await;
     assert_eq!(fake.opens(), 3);
+}
+
+/// D18: while a resumable session is parked, a request already in flight gets its reply
+/// after the resume (same process, no handshake replay); new requests fail at once,
+/// cached methods and `ping` are answered.
+#[tokio::test(start_paused = true)]
+async fn detached_session_keeps_in_flight_and_fails_new_requests_fast() {
+    let fake = Fake::default();
+    fake.online(true);
+    let (dir, cache) = temp_cache("detached");
+    let mut c = start(&fake, cache);
+    c.init(1).await;
+    c.call(2, "tools/list", json!({})).await;
+    fake.set_hold(true);
+    c.send(json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":echo("in flight")}))
+        .await;
+    tokio::task::yield_now().await;
+    fake.set_detached(true);
+    let r = c.call(11, "tools/call", echo("new")).await;
+    assert!(err_msg(&r).contains("session is kept"), "{r}");
+    let r = c.call(12, "tools/list", json!({})).await;
+    assert_eq!(r["result"]["tools"][0]["name"], "echo");
+    let r = c.call(13, "ping", json!({})).await;
+    assert_eq!(r["result"], json!({}));
+    fake.set_detached(false);
+    fake.set_hold(false);
+    let r = c.recv().await;
+    assert_eq!(r["id"], 10, "{r}");
+    assert_eq!(r["result"]["content"][0]["text"], "in flight");
+    let r = c.call(14, "tools/call", echo("after")).await;
+    assert_eq!(r["result"]["content"][0]["text"], "after");
+    assert!(c.close().await.is_empty());
+    assert_eq!(fake.opens(), 1);
+    assert_eq!(
+        fake.seen_methods(),
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+            "tools/call"
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// D18: an in-flight request still unanswered `DETACHED_GRACE` after the link loss fails;
+/// its late reply (after the resume) is dropped, never delivered twice.
+#[tokio::test(start_paused = true)]
+async fn detached_grace_fails_in_flight_and_drops_the_late_reply() {
+    let fake = Fake::default();
+    fake.online(true);
+    let (dir, cache) = temp_cache("grace");
+    let mut c = start(&fake, cache);
+    c.init(1).await;
+    fake.set_hold(true);
+    c.send(json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":echo("late")}))
+        .await;
+    tokio::task::yield_now().await;
+    fake.set_detached(true);
+    let t0 = Instant::now();
+    let r = c.recv_within(DETACHED_GRACE * 2).await;
+    assert_eq!(r["id"], 20);
+    assert!(err_msg(&r).contains("no reply"), "{r}");
+    assert!(t0.elapsed() >= DETACHED_GRACE, "{:?}", t0.elapsed());
+    fake.set_detached(false);
+    fake.set_hold(false);
+    // The late reply to 20 is dropped: the next line is the answer to 21.
+    let r = c.call(21, "tools/call", echo("next")).await;
+    assert_eq!(r["result"]["content"][0]["text"], "next");
+    assert!(c.close().await.is_empty());
+    assert_eq!(fake.opens(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
 }

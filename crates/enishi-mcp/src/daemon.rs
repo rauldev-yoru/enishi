@@ -1,6 +1,7 @@
 //! The real [`Connector`]: each open is an `enishi run`-style session through the local
-//! daemon (`IpcRequest::Run` for a published service, `IpcRequest::Open` with
-//! `SessionKind::Mcp` for a transparent-mode command), with stdout split into JSON-RPC
+//! daemon (`IpcRequest::Open` with a resumable `SessionKind::Service` for a published
+//! service or `SessionKind::Mcp` for a transparent-mode command; `IpcRequest::Run` / plain
+//! `Open` with a daemon older than 0.1.2), with stdout split into JSON-RPC
 //! lines and the service's stderr copied to ours (agents log the shim's stderr).
 
 use std::time::Duration;
@@ -71,18 +72,34 @@ impl Connector for DaemonConnector {
 
     async fn open(&self) -> Result<Remote, OpenError> {
         let device = Some(self.device.clone());
-        let req = match &self.target {
-            Target::Service { name, args } => IpcRequest::Run {
-                device,
-                service: name.clone(),
-                args: args.clone(),
-            },
-            Target::Command(r) => IpcRequest::Open {
-                device,
-                header: SessionKind::Mcp(r.clone()),
-            },
+        let (header, legacy) = match &self.target {
+            Target::Service { name, args } => (
+                SessionKind::Service {
+                    name: name.clone(),
+                    args: args.clone(),
+                },
+                IpcRequest::Run {
+                    device: device.clone(),
+                    service: name.clone(),
+                    args: args.clone(),
+                },
+            ),
+            Target::Command(r) => (
+                SessionKind::Mcp(r.clone()),
+                IpcRequest::Open {
+                    device: device.clone(),
+                    header: SessionKind::Mcp(r.clone()),
+                },
+            ),
         };
-        let stream = ipc::open_session(&self.paths, &req)
+        // Resumable (design D18): a link loss parks the session in the daemon and the
+        // same process continues once the device is back — this remote stays open, so no
+        // handshake replay. Only a failed resume ends it (then the shim reconnects).
+        let req = IpcRequest::Open {
+            device,
+            header: SessionKind::Resumable(Box::new(header)),
+        };
+        let stream = ipc::open_session_or(&self.paths, &req, &legacy)
             .await
             .map_err(|(code, message)| OpenError {
                 code,
@@ -96,6 +113,7 @@ impl Connector for DaemonConnector {
         let (to_remote, mut to_remote_rx) = mpsc::channel::<Value>(64);
         let (from_remote_tx, from_remote) = mpsc::channel::<Value>(64);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (detached_tx, detached) = tokio::sync::watch::channel(None);
         let label = format!("{}/{}", self.device, self.target.label());
 
         // Shim → service stdin. After the shim drops its sender: stdin EOF, but the IPC
@@ -163,6 +181,14 @@ impl Connector for DaemonConnector {
                         eprintln!("enishi mcp {label}: session ended: {message} (code {code})");
                         break;
                     }
+                    Ok(ExecFrame::Detached { message }) => {
+                        eprintln!("enishi mcp {label}: {message}");
+                        let _ = detached_tx.send(Some(tokio::time::Instant::now()));
+                    }
+                    Ok(ExecFrame::Resumed) => {
+                        eprintln!("enishi mcp {label}: link back, same session resumed");
+                        let _ = detached_tx.send(None);
+                    }
                     Ok(_) => {}
                     Err(_) => {
                         eprintln!("enishi mcp {label}: lost the local daemon");
@@ -175,6 +201,7 @@ impl Connector for DaemonConnector {
         Ok(Remote {
             tx: to_remote,
             rx: from_remote,
+            detached,
         })
     }
 }

@@ -21,7 +21,7 @@
 //! - on stdin EOF, replies still in flight are awaited (up to [`FLUSH_TIMEOUT`]).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     time::Duration,
 };
@@ -29,7 +29,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::Instant,
 };
 
@@ -52,14 +52,32 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// While a handshake replay is in progress, how long a request that cannot be answered
 /// from the cache waits for it before failing.
 pub const START_HOLD: Duration = Duration::from_secs(3);
+const DETACHED_REASON: &str =
+    "link to the device lost; the remote session is kept and resumes when it is back";
+
 /// After stdin EOF, how long to wait for replies still in flight.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After the link of a resumable session is lost (design D18), how long requests already
+/// in flight wait for their reply (it arrives after a resume) before they fail.
+pub const DETACHED_GRACE: Duration = Duration::from_secs(30);
 
 /// An open session with the remote service, as JSON-RPC messages. Dropping `tx` closes the
 /// service's stdin; `rx` ending means the session is gone (process exited, link lost).
 pub struct Remote {
     pub tx: mpsc::Sender<Value>,
     pub rx: mpsc::Receiver<Value>,
+    /// Resumable sessions (design D18): `Some(since)` while the link is lost and the
+    /// session is parked (the same process continues after a resume).
+    pub detached: watch::Receiver<Option<Instant>>,
+}
+
+impl Remote {
+    /// A remote that is never detached.
+    pub fn new(tx: mpsc::Sender<Value>, rx: mpsc::Receiver<Value>) -> Remote {
+        let (_, detached) = watch::channel(None);
+        Remote { tx, rx, detached }
+    }
 }
 
 /// Why a remote could not be opened (shown to the client and on stderr).
@@ -120,6 +138,9 @@ struct Shim<C> {
     /// an outage, so the client is told to fix permissions rather than wait.
     refused: bool,
     logged: Option<String>,
+    /// Requests failed after [`DETACHED_GRACE`]: a late reply (after a resume) is dropped,
+    /// the client already got an error for that id.
+    abandoned: HashSet<String>,
 }
 
 fn id_key(id: &Value) -> String {
@@ -153,12 +174,18 @@ enum Event {
     FlushTimeout,
     /// A replay or hold deadline passed.
     Timer,
+    /// The remote was detached or resumed (D18).
+    LinkState,
 }
 
-async fn recv(link: &mut Option<Remote>) -> Option<Value> {
-    match link {
-        Some(r) => r.rx.recv().await,
-        None => std::future::pending().await,
+/// The next message from the remote, or a change of its link state (D18).
+async fn recv(link: &mut Option<Remote>) -> Event {
+    let Some(r) = link else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        m = r.rx.recv() => Event::Remote(m),
+        Ok(()) = r.detached.changed() => Event::LinkState,
     }
 }
 
@@ -201,6 +228,7 @@ where
         reason: "not connected yet".into(),
         refused: false,
         logged: None,
+        abandoned: HashSet::new(),
     };
     let mut lines = BufReader::new(input).lines();
     let mut eof_at: Option<Instant> = None;
@@ -214,7 +242,7 @@ where
         let timer = shim.next_timer();
         let ev = tokio::select! {
             l = lines.next_line(), if eof_at.is_none() => Event::Client(l.ok().flatten()),
-            m = recv(&mut shim.link) => Event::Remote(m),
+            e = recv(&mut shim.link) => e,
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => Event::FlushTimeout,
             _ = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now)), if timer.is_some() => Event::Timer,
         };
@@ -223,7 +251,7 @@ where
             Event::Client(None) => eof_at = Some(Instant::now()),
             Event::Remote(Some(v)) => shim.on_remote(v).await,
             Event::Remote(None) => shim.lost("the remote session ended"),
-            Event::Timer => shim.on_timer(),
+            Event::Timer | Event::LinkState => shim.on_timer(),
             Event::FlushTimeout => {
                 shim.lost("the client closed stdin and no reply came in time");
                 break;
@@ -300,7 +328,28 @@ impl<C: Connector> Shim<C> {
             }
             return;
         }
+        if self.detached_since().is_some() {
+            // Link lost, session parked: new requests fail at once (cached methods and
+            // `ping` are answered) instead of waiting for the device; notifications go
+            // through (queued, delivered after the resume).
+            match id {
+                Some(id) => {
+                    self.reason = DETACHED_REASON.into();
+                    self.offline_reply(&method, Some(id), &msg);
+                }
+                None => {
+                    if let Some(link) = &self.link {
+                        let _ = link.tx.try_send(msg);
+                    }
+                }
+            }
+            return;
+        }
         self.forward(method, id, msg).await;
+    }
+
+    fn detached_since(&self) -> Option<Instant> {
+        self.link.as_ref().and_then(|l| *l.detached.borrow())
     }
 
     /// Send a client request/notification on the live link (or answer it offline).
@@ -455,14 +504,30 @@ impl<C: Connector> Shim<C> {
     fn next_timer(&self) -> Option<Instant> {
         let hold = self.held.front().map(|h| h.until);
         let replay = self.starting.as_ref().map(|r| r.deadline);
-        match (hold, replay) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let grace = self
+            .detached_since()
+            .filter(|_| !self.pending.is_empty())
+            .map(|t| t + DETACHED_GRACE);
+        [hold, replay, grace].into_iter().flatten().min()
     }
 
     fn on_timer(&mut self) {
         let now = Instant::now();
+        if let Some(since) = self.detached_since()
+            && since + DETACHED_GRACE <= now
+        {
+            for (k, p) in std::mem::take(&mut self.pending) {
+                let msg = format!(
+                    "enishi: no reply to `{}` within {}s of losing the link to {} (it may still \
+                     have run there); the session is kept and resumes when the device is back",
+                    p.method,
+                    DETACHED_GRACE.as_secs(),
+                    self.label
+                );
+                self.send(error(p.id, msg));
+                self.abandoned.insert(k);
+            }
+        }
         if let Some(r) = &self.starting
             && r.deadline <= now
         {
@@ -485,6 +550,9 @@ impl<C: Connector> Shim<C> {
                 return self.finish_replay(v).await;
             }
             // Notifications (logs) the server sends while starting reach the client.
+        }
+        if is_response(&v) && self.abandoned.remove(&id_key(&v["id"])) {
+            return; // the client was already given an error for it
         }
         if is_response(&v)
             && let Some(p) = self.pending.remove(&id_key(&v["id"]))
