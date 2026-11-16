@@ -734,7 +734,11 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        // A windowless daemon (the logon task's GUI-subsystem copy) has no console: if the
+        // handler cannot be installed, run until killed instead of shutting down at once.
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 

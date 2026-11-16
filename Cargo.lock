@@ -694,8 +694,12 @@ dependencies = [
  "enishi-core",
  "enishi-mcp",
  "enishi-proto",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -16,6 +16,8 @@ use enishi_proto::{
 };
 
 mod exec;
+mod install;
+mod logging;
 mod manage;
 mod mcp_cmd;
 
@@ -36,7 +38,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the daemon in the foreground
-    Up,
+    Up {
+        /// Also log to a size-rotated file (default: enishi.log in the config dir); the
+        /// installed service / logon task runs with this
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        log_file: Option<Option<PathBuf>>,
+    },
+    /// Print (-f: follow) the daemon log written by the installed service / logon task
+    Logs {
+        /// Keep printing new lines (survives rotation)
+        #[arg(short, long)]
+        follow: bool,
+        /// Show the last N lines (0 = all)
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
+    /// Install for this user: binary, autostart (systemd user unit / logon task), start it
+    Install(install::InstallArgs),
+    /// Reverse `enishi install` (--purge --yes also deletes config, identity and cache)
+    Uninstall(install::UninstallArgs),
+    /// Windows: add (or --remove) the Private-only firewall rule for enishi (needs admin)
+    Firewall(install::FirewallArgs),
     /// Print this device's public id
     Id,
     /// Pair with another device
@@ -152,8 +174,9 @@ pub(crate) fn code(c: i32) -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let paths = Paths::resolve(cli.config.as_deref())?;
     match cli.cmd {
-        Cmd::Up => {
-            init_logging();
+        Cmd::Up { log_file } => {
+            let log_file = log_file.map(|p| p.unwrap_or_else(|| paths.log_file()));
+            logging::init(log_file.as_deref())?;
             let cfg = Config::load(&paths.config_file)?;
             let key = identity::load_or_create(&paths.identity_key())?;
             enishi_core::daemon::run(cfg, paths, key).await?;
@@ -212,6 +235,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Mcp(args) => mcp_cmd::run(paths, cli.config, cli.device, args).await,
         Cmd::Service { action } => manage::service(&paths, action).await,
         Cmd::Grant(args) => manage::grant(&paths, args).await,
+        Cmd::Logs { follow, lines } => logging::show(&paths.log_file(), lines, follow),
+        Cmd::Install(args) => install::install(&paths, args).await,
+        Cmd::Uninstall(args) => install::uninstall(&paths, args).await,
+        Cmd::Firewall(args) => install::firewall(args),
     }
 }
 
@@ -306,16 +333,6 @@ pub(crate) fn parse_env(s: &str) -> Result<(String, String), String> {
         Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
         _ => Err(format!("expected KEY=VALUE, got {s:?}")),
     }
-}
-
-fn init_logging() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_env("ENISHI_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn,enishi=info,enishi_core=info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
 }
 
 async fn status(paths: &Paths, device: Option<String>) -> Result<ExitCode> {

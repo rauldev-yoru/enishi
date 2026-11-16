@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 
 pub const CONFIG_FILE: &str = "enishi.toml";
 pub const IDENTITY_FILE: &str = "identity.key";
+pub const LOG_FILE: &str = "enishi.log";
 #[cfg(unix)]
 const SOCKET_FILE: &str = "enishi.sock";
 
@@ -57,6 +58,12 @@ impl Paths {
 
     pub fn identity_key(&self) -> PathBuf {
         self.dir.join(IDENTITY_FILE)
+    }
+
+    /// Daemon log written by `enishi up --log-file` (the service / logon task), read by
+    /// `enishi logs`.
+    pub fn log_file(&self) -> PathBuf {
+        self.dir.join(LOG_FILE)
     }
 
     /// Unix socket of the local daemon: `$XDG_RUNTIME_DIR/enishi.sock`, falling back to the
