@@ -42,6 +42,8 @@ pub const BACKOFF_MAX: Duration = Duration::from_millis(1500);
 pub const RESUME_JUMP: Duration = Duration::from_secs(5);
 /// Bound for a single ctl request/response on an incoming connection.
 const SERVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// "rejected unknown peer" is logged at most once per peer per this interval.
+const REJECT_LOG_EVERY: Duration = Duration::from_secs(60);
 
 const CLOSE_REJECTED: u32 = 1;
 const CLOSE_RESET: u32 = 2;
@@ -173,17 +175,55 @@ impl Shared {
     }
 }
 
+/// Logs a key at most once per interval.
+#[derive(Debug)]
+pub(crate) struct RateLimit<K> {
+    every: Duration,
+    last: Mutex<HashMap<K, Instant>>,
+}
+
+impl<K: std::hash::Hash + Eq> RateLimit<K> {
+    pub(crate) fn new(every: Duration) -> Self {
+        RateLimit {
+            every,
+            last: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn allow(&self, key: K, now: Instant) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.len() > 1024 {
+            let every = self.every;
+            last.retain(|_, t| now.saturating_duration_since(*t) < every);
+        }
+        match last.get(&key) {
+            Some(t) if now.saturating_duration_since(*t) < self.every => false,
+            _ => {
+                last.insert(key, now);
+                true
+            }
+        }
+    }
+}
+
 /// Rejects every peer that is not in the config, right after the TLS handshake.
 #[derive(Debug)]
-struct AllowList(Vec<EndpointId>);
+struct AllowList {
+    ids: Vec<EndpointId>,
+    log: RateLimit<EndpointId>,
+}
 
 impl EndpointHooks for AllowList {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
-        if self.0.contains(&id) {
+        if self.ids.contains(&id) {
             AfterHandshakeOutcome::Accept
         } else {
-            warn!(peer = %id, "rejected connection from unknown peer");
+            if self.log.allow(id, Instant::now()) {
+                warn!(peer = %id, "rejected connection from unknown peer (logged once a minute)");
+            } else {
+                debug!(peer = %id, "rejected connection from unknown peer");
+            }
             AfterHandshakeOutcome::Reject {
                 error_code: CLOSE_REJECTED.into(),
                 reason: b"unknown peer".to_vec(),
@@ -232,7 +272,10 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(key)
         .alpns(vec![ALPN_CTL.to_vec()])
-        .hooks(AllowList(peers.iter().map(|p| p.id).collect()));
+        .hooks(AllowList {
+            ids: peers.iter().map(|p| p.id).collect(),
+            log: RateLimit::new(REJECT_LOG_EVERY),
+        });
     if let Some(port) = cfg.device.listen_port {
         builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))?;
     }
@@ -507,5 +550,24 @@ async fn watch_clock(sh: Arc<Shared>) {
                 p.request_reconnect(true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_once_per_interval_per_key() {
+        let rl = RateLimit::new(Duration::from_secs(60));
+        let t = Instant::now();
+        assert!(rl.allow(1, t));
+        assert!(!rl.allow(1, t + Duration::from_secs(1)));
+        assert!(
+            rl.allow(2, t + Duration::from_secs(1)),
+            "other key unaffected"
+        );
+        assert!(!rl.allow(1, t + Duration::from_secs(59)));
+        assert!(rl.allow(1, t + Duration::from_secs(61)));
     }
 }
