@@ -64,6 +64,7 @@ clashes with real flags, working shell completion). Decided in D1.
 |---|---|
 | `enishi up [--log-file [PATH]]` | Run the daemon (foreground). `--log-file` also writes a size-rotated log (default `enishi.log` in the config dir); the installed unit / task runs `up --log-file`. |
 | `enishi install [--prefix DIR] [--name N] [--no-start] [--no-firewall]` / `enishi uninstall [--name N] [--purge --yes] [--no-firewall]` | Per-user install: binary, autostart (systemd user unit / logon task), start; reverse it (§7). |
+| `enishi [-d dev] update [--version vX.Y.Z \| --from-file PATH] [--check] [--status] [--timeout S]` | Update the installed enishi through a detached, rollback-safe updater (§7, D17); with `-d`, ask that device to update itself (its `update` grant, D16) and follow it until it is back. |
 | `enishi logs [-n N] [-f]` | Print / follow the daemon log file. |
 | `enishi firewall [--name N] [--remove \| --check]` | Windows: Private-only inbound rule for enishi (self-elevates: one UAC prompt; `--check` is read-only). |
 | `enishi id` | Print this device's public id. |
@@ -81,7 +82,7 @@ clashes with real flags, working shell completion). Decided in D1.
 | `enishi service add <name> [--mcp\|--stdio\|--tcp host:port] [--allow peer]… [--allow-args] [--cwd D] [--env K=V]… [--force] [-- cmd…]` | Publish a local service (edits `enishi.toml`, then reloads the daemon). |
 | `enishi service list` / `enishi service remove <name>` | Local published services (name, kind, args, allow, command/target) / unpublish. |
 | `enishi service import <format> <file> [--allow peer]… [--only a,b] [--dry-run] [--force]` | Publish services from another tool's config; formats are pluggable (`mcp` today, §3.7). |
-| `enishi grant <peer> [--exec\|--no-exec] [--mcp\|--no-mcp] [--service S]… [--revoke-service S]…` | Show or change `[grants.<peer>]`; granting a service also adds the peer to its `allow` (§3.7). |
+| `enishi grant <peer> [--exec\|--no-exec] [--mcp\|--no-mcp] [--update\|--no-update] [--service S]… [--revoke-service S]…` | Show or change `[grants.<peer>]`; granting a service also adds the peer to its `allow` (§3.7). |
 | `enishi wake [-d dev]` | Wake-on-LAN through another online peer on the same LAN. v0.2. |
 
 ### 3.3 `exec` details
@@ -298,6 +299,7 @@ env = { NODE_ENV = "production" }   # optional
 [grants.server]               # what peer "server" may do on this device
 exec = true                   # run arbitrary commands (off by default)
 mcp = false                   # start arbitrary MCP commands (transparent mode, §3.5)
+update = false                # update enishi here (`enishi -d <this> update`, D16; 0.1.1+)
 services = ["fs", "ps"]
 ```
 
@@ -586,6 +588,59 @@ tests and builds `x86_64-unknown-linux-gnu` (on ubuntu-22.04 for an older glibc)
 `SHA256SUMS`. The README's one-liners download a binary, verify it against `SHA256SUMS`
 and run `install` (integrity only: both files come from the same release).
 
+**Updating (v0.1.1, bug #11).** Upgrading by re-running the installer *through* enishi
+(`enishi -d pc exec -- irm …/install.ps1 | iex`) used to leave the device with no daemon: the
+installer ran inside the daemon's lifetime — on Windows in the logon task's job object (ending
+the task kills the whole job), on Linux in the unit's cgroup (`systemctl restart` kills every
+process in it) — so stopping the old daemon killed the installer half-way. `enishi update`
+therefore runs in two stages (D17):
+
+1. **Stage 1** (the `enishi update` process, wherever it runs): resolve the install (the
+   record whose binary is running, else `--name`, default `enishi`) and its config; pick the
+   source — the newest release from `api.github.com/…/releases?per_page=1` (pre-releases
+   included, like `install.sh`/`install.ps1`), `--version vX.Y.Z`, or `--from-file` — download
+   this OS's asset and check it against the release's `SHA256SUMS`; stage it in
+   `<data dir>/enishi/update/<name>/` and probe it (`--version` must print `enishi <ver>`,
+   matching the tag); copy itself next to it as the updater (Windows: GUI-subsystem copy, so
+   no console window even under Task Scheduler); then launch stage 2 **outside the daemon's
+   lifetime**:
+   - Linux: `systemd-run --user --collect --unit=<name>-update-<id>` (its own transient
+     unit, so outside the daemon's cgroup; output appended to `update.log`); fallback
+     `setsid -f` when systemd-run is unavailable.
+   - Windows: `CreateProcess` with `CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
+     CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, created suspended and resumed only if
+     `IsProcessInJob` says it left every job (the `exec` job sets
+     `JOB_OBJECT_LIMIT_BREAKAWAY_OK`; Task Scheduler's own job may not allow it). Otherwise a
+     one-shot scheduled task `<name>-update-<id>` (no trigger, interactive token, 30 min limit)
+     runs the updater, which deletes the task when done.
+2. **Stage 2** (detached, `update --stage2`): back up the installed binaries, stop the daemon
+   (`systemctl --user stop` / `schtasks /End` + kill by exact image path), install the staged
+   binary with the normal install code (`--no-start`, firewall untouched), start the daemon and
+   wait (30 s) until it answers over IPC **with the new version**. Any failure after the stop
+   → **rollback**: restore the backed-up binaries and the old install record, start the
+   daemon again and wait for it. Stage 2 waits 1–2 s before stopping so the caller (an `exec`
+   session, a remote ack) gets its answer first.
+
+Both stages write `update.json` next to the config (id, origin `local` / `exec` / `peer:<name>`,
+from/to version, source, state `running|done|failed|rolled_back|rollback_failed`, and a phase
+timeline: `requested`, `downloaded`, `verified`, `detached`, `stopped`, `swapped`, `started`,
+`done` | `failed` | `rolling_back` → `rolled_back` / `rollback_failed`) and append to
+`update.log`. A second update is refused while one is `running` (stale after 15 min).
+`enishi install` run from inside the installed daemon (an `exec` child: same cgroup / an
+ancestor is the installed `enishiw.exe`) hands over to the same detached path.
+
+**Remote update.** `enishi -d dev update [--version v | --from-file PATH-on-dev]` sends
+`CtlRequest::Update`; the device checks `[grants.<caller>] update = true` (D16), audits it,
+starts stage 1 as a child of its daemon (which detaches stage 2 as above) and acks at once with
+the update id. The caller then polls `CtlRequest::UpdateStatus` (version + `update.json`) every
+second, printing new phases; the link drops while the daemon restarts (expected, reported) and
+the command returns when the update with that id reaches a final state (exit 0 only for
+`done` with the device reporting the new version), or after `--timeout` (default 180 s).
+`--push` (sending the caller's binary over a stream instead of downloading on the device) is
+not implemented yet; `--from-file` with a path on the device covers offline devices.
+`ENISHI_RELEASES_API` / `ENISHI_RELEASES_URL` override the GitHub endpoints (mirrors, tests);
+`ENISHI_UPDATE_FAIL_AT=stop|swap|start|health` makes stage 2 fail on purpose (tests only).
+
 ## 8. Repository layout
 
 ```
@@ -631,3 +686,5 @@ builds for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` + `SHA256SUMS
 | **D13** | Transparent MCP (`enishi mcp -d dev -- cmd…`) needs its own grant `mcp = true` (`McpPolicy`, same enum as `ExecPolicy`, one `authorize_mcp`). `exec = true` does not imply it: `exec` is for humans/scripts with a shell, `mcp` is what an agent config may trigger unattended; keeping them apart lets a device allow one without the other (and later allowlist MCP packages only). Published services keep working with services grants alone. |
 | **D14** | TCP forwarding: `kind = "tcp"` services (`target`), one QUIC bi-stream per TCP connection on the warm stream connection, connect-before-ack, half-close preserved, fast fail while the peer is offline with the listener kept. Listeners live in the daemon (`enishi forward` holds one for its lifetime; `[forwards.*]` for the daemon's). |
 | **D15** | Packaging is the binary itself: `enishi install/uninstall` per user (systemd user unit / logon scheduled task + user PATH), no admin except the Private-only firewall rule, which install sets automatically with one UAC prompt before the daemon first listens (decline → still works outbound; Linux: offered sudo for firewalld/ufw); idempotent re-install = upgrade; an install record makes uninstall exact. Windows runs a GUI-subsystem copy (`enishiw.exe`) so the daemon never has a console window. The service logs to a 5 MiB-rotated file in the config dir (`enishi logs`). |
+| **D16** | Remote update needs its own grant `[grants.<peer>] update = true` (default deny, `enishi grant <peer> --update`, one `authorize_update`). `exec = true` does not imply it: exec can already run an installer, but `update` is a narrow, audited capability (fixed binary source, checksum, rollback) that a device may want to give a peer that has no shell at all. `update --status` needs the same grant. |
+| **D17** | Updates never run inside the daemon's lifetime: stage 1 verifies and stages, stage 2 is detached (Linux: transient `systemd-run --user` unit, fallback `setsid -f`; Windows: job breakaway checked with `IsProcessInJob`, fallback one-shot scheduled task) and owns stop → swap → start → health check (new version over IPC), rolling back to the backed-up binary and record on any failure after the stop. Progress is a phase timeline in `update.json` (+ `update.log`), which is also what a remote caller polls. |

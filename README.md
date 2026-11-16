@@ -13,7 +13,7 @@ today; macOS and phone later). Once two devices are paired you can, from either 
 It was built for AI agents that live on a server but need to act on your PC (your real browser,
 your apps, your corporate VPN), and it is just as useful from a plain terminal.
 
-Status: **v0.1.0** — link, presence, pairing, `exec`, services, MCP and TCP forwarding work
+Status: **v0.1.1** — link, presence, pairing, `exec`, services, MCP and TCP forwarding work
 and are tested Linux ↔ Windows (x86_64), and `enishi install` sets it up as a per-user
 service. See the [changelog](CHANGELOG.md) for what is in it and the known limitations.
 
@@ -77,8 +77,15 @@ What `install` does:
   first; without a terminal it only prints it). No fixed `listen_port` → outbound-only, which
   still works.
 
-Re-running `enishi install` from a newer binary upgrades in place (stops the daemon, swaps the
-files, starts it again). `enishi uninstall` removes the service/task, the `PATH` entry and the
+**Updating:** `enishi update` installs the newest release (`--version vX.Y.Z` to pin one,
+`--from-file PATH` for a binary you already have, `--check` to only compare versions). A
+detached updater stops the daemon, swaps the binary, starts it again and checks it answers
+with the new version — if anything fails after the stop it puts the old binary back and
+restarts it, so a device is never left without its daemon. From another device:
+`enishi -d <device> update` (needs `enishi grant <your device> --update` on that device;
+`exec` does not imply it). It returns when the device is back with the new version, printing
+each phase; `enishi [-d <device>] update --status` shows the last update. Re-running
+`enishi install` from a newer binary also upgrades in place. `enishi uninstall` removes the service/task, the `PATH` entry and the
 binaries; `--purge --yes` also deletes the config, the device identity and the logs.
 Options: `--prefix DIR` (install dir), `--name NAME` (unit/task name, to run a second instance,
 e.g. with `--config`), `--no-start`, `--no-firewall`. A non-default config (`--config` / `ENISHI_CONFIG`) given at
@@ -103,6 +110,7 @@ A new peer can do **nothing** until you grant it something:
 enishi grant server --exec                 # let "server" run commands here
 enishi grant server --service filesystem   # let it use one published service
 enishi grant server --mcp                  # let it start MCP servers here (transparent mode)
+enishi grant server --update               # let it update enishi here (enishi -d <this> update)
 ```
 
 ## Run commands
@@ -183,8 +191,8 @@ every TCP connection is a stream inside the one encrypted link. Forwards can als
 
 - Identity is an Ed25519 key per device; only paired keys are accepted.
 - Pairing uses one-time, expiring invites.
-- Everything is denied unless granted per peer: `exec`, transparent `mcp` and each service are
-  separate grants.
+- Everything is denied unless granted per peer: `exec`, transparent `mcp`, remote `update` and
+  each service are separate grants.
 - Every session is written to a local audit log (`audit.jsonl`).
 
 ## Measured (Linux server ↔ Windows 11, LAN)

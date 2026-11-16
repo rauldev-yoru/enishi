@@ -4,6 +4,40 @@ All notable changes to enishi are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-11-16
+
+### Fixed
+
+- **#11** Updating a device through enishi (`enishi -d pc exec -- irm …/install.ps1 | iex`,
+  or `enishi install` from an `exec`) could leave it with **no daemon**: the installer ran
+  inside the daemon's job object (Windows) / the unit's cgroup (Linux), so stopping the old
+  daemon killed it half-way. Updates now run in a detached updater outside the daemon's
+  lifetime (systemd-run transient unit; Windows job breakaway, else a one-shot scheduled
+  task) that rolls back to the old binary if anything fails after the stop. `enishi install`
+  run from inside the installed daemon hands over to it automatically, and `exec` children
+  may now break away from their job object on purpose.
+
+### Added
+
+- `enishi update [--version vX.Y.Z | --from-file PATH] [--check] [--status]`: downloads the
+  release asset for this OS (newest, pre-releases included, like the install scripts),
+  verifies it against `SHA256SUMS` and `--version`, then stop → swap → start → health check
+  (the daemon must answer with the new version), with rollback. Phases are recorded in
+  `update.json` / `update.log` next to the config.
+- Remote update: `enishi -d <device> update [...]` asks the device's daemon to update
+  itself, follows it through the restart (link down → back online) and prints the phase
+  timeline and result (`--timeout`, default 180 s; `--no-wait`; `--status`).
+- `update` grant (`[grants.<peer>] update = true`, `enishi grant <peer> --update`), default
+  deny and **not** implied by `exec`; remote update requests are written to the audit log.
+
+### Notes
+
+- A config that sets `update = …` in a grant is rejected by 0.1.0 (unknown field); update the
+  device before granting it.
+- Talking to a 0.1.0 peer, `enishi -d <peer> update` fails (unknown request): update that
+  device once by hand (`enishi update` there, or the install one-liner outside enishi).
+- `--push` (sending the caller's binary to the device) is not implemented yet.
+
 ## [0.1.0] — 2026-11-16
 
 First stable release: a P2P link between your own devices (Linux ↔ Windows, x86_64), with
@@ -84,4 +118,5 @@ stdio services, MCP servers and TCP ports published across it, built for devices
   are untested.
 - x86_64 Linux and Windows only; macOS, ARM and phones are not supported yet.
 
+[0.1.1]: https://github.com/rauldev-yoru/enishi/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rauldev-yoru/enishi/releases/tag/v0.1.0
