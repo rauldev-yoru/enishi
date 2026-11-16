@@ -69,7 +69,7 @@ clashes with real flags, working shell completion). Decided in D1.
 | `enishi status [-d dev]` | Peers, presence (`online`, `asleep/offline`, last seen), latency. |
 | `enishi exec [-d dev] [opts] -- <cmd> [args…]` | Run a native command on the peer; stdin/stdout/stderr streamed, exit code propagated. |
 | `enishi shell [-d dev]` | Interactive shell on the peer (PTY / ConPTY). v0.2. |
-| `enishi run [-d dev] <service>` | Pipe local stdio to a published service (raw). |
+| `enishi run [-d dev] <service> [-- args]` | Pipe local stdio to a published service (raw). |
 | `enishi mcp [dev/]<service> [-- extra args]` | Same as `run`, MCP-aware: cached `initialize`/`tools/list`, offline errors, handshake replay. This is what agents put in their config. |
 | `enishi services [-d dev]` | List services the peer publishes to us. |
 | `enishi wake [-d dev]` | Wake-on-LAN through another online peer on the same LAN. v0.2. |
@@ -137,6 +137,35 @@ Extra args after `--` are forwarded to the remote MCP server **only if** the ser
 definition allows it (`allow_args`), so an agent can't turn a published MCP into
 arbitrary execution.
 
+enishi ships **no MCP servers and no service-specific logic**: a service is any stdio
+program the publishing user declares, and the shim only speaks MCP framing
+(newline-delimited JSON-RPC 2.0) and the handshake. As implemented (v0.1 step 5,
+crate `enishi-mcp`, ported from the PoC):
+
+- The remote is opened lazily (first client message) as an ordinary `run` session through
+  the local daemon; the remote server's stderr is copied to the shim's stderr (agents log
+  it). A remote that is lost (peer offline, process exited) is re-opened on the next
+  message, which respawns the service.
+- Online: pure pass-through. The results of `initialize`, `tools/list`, `prompts/list`,
+  `resources/list` and `resources/templates/list` (requests without `cursor`) are cached
+  on disk per device + service (+ hash of extra args): `$ENISHI_CACHE_DIR`, else
+  `$XDG_CACHE_HOME/enishi` / `~/.cache/enishi` (Linux) or `%LOCALAPPDATA%\enishi\cache`
+  (Windows), file `mcp/<device>/<service>.json`.
+- Offline (peer offline, service refused, or **local daemon not running**): those methods
+  are answered from the cache, `ping` with `{}`, every other request gets an immediate
+  JSON-RPC error `-32000` naming the reason; notifications and client responses are
+  dropped. A one-line state change goes to stderr (`offline: … (answering from cache)`,
+  with a `start it with enishi up` hint when the daemon is down). `initialize` with no
+  cache is an error, never a fabricated answer.
+- When a remote is opened and the client is already past `initialize` (mid-session
+  reconnect, or initialized from cache), the shim first replays the client's
+  `initialize` with an internal id (`enishi-replay-N`, 15 s bound) plus
+  `notifications/initialized`; a client `notifications/initialized` that arrives right
+  then is not duplicated.
+- Requests in flight when the remote is lost get an error at once. On stdin EOF the shim
+  waits up to 10 s for replies still in flight, then closes the service's stdin.
+- Batches (MCP 2025-03-26) are handled element by element.
+
 ## 4. Configuration
 
 One file per device: `~/.config/enishi/enishi.toml` (Linux) /
@@ -156,9 +185,11 @@ addrs = ["100.71.180.5:7802"] # optional hints (Tailscale/LAN); discovery otherw
 # What this device publishes, and to whom
 [services.fs]
 command = ["node", "C:/…/server-filesystem/dist/index.js", "C:/Users/raulr/Projects"]
-kind = "mcp"                  # mcp | stdio
+kind = "mcp"                  # mcp | stdio (default)
 allow = ["server"]            # peer names
 allow_args = false
+cwd = "~"                     # optional; default: the daemon's
+env = { NODE_ENV = "production" }   # optional
 
 [grants.server]               # what peer "server" may do on this device
 exec = true                   # run arbitrary commands (off by default)
@@ -173,6 +204,16 @@ identities). `identity.key` (32 raw bytes) is created on first use (`enishi id` 
 
 Rule: **everything is denied unless granted**, per peer. `exec` is the most powerful grant
 and is opt-in.
+
+Services (D9): a peer may open service `S` only if **`S.allow` lists the peer AND
+`[grants.<peer>] services` contains `S`** — the service says who may use it, the grant says
+what the peer may use; both default to empty. Extra args are refused unless
+`allow_args = true`. Refusals: `253` no such service, `254` not allowed (missing from
+either list, or args given without `allow_args`). `exec = true` does not imply any
+service. The command is spawned as argv (never through a shell) via the exec spawn path
+(own process group / job object, `CREATE_NO_WINDOW`, tree killed when the caller goes
+away); no timeout. `enishi services` lists exactly the services the asking peer may open
+(name, kind, allow_args).
 
 `exec` is modelled as a policy, not a plain bool, so command allowlists can be added
 later without breaking configs (D5):
@@ -205,18 +246,20 @@ connection per peer with this ALPN, dialed right after the ctl hello and dropped
 (a close of either marks the peer offline). One bi-stream per session:
 
 1. caller → `SessionKind::Exec(ExecRequest {command, shell, raw, cwd, env, timeout_secs})`
-   (`Service {name, args}` is reserved and answered with `253` for now);
+   or `SessionKind::Service {name, args}` (v0.1 step 5);
 2. peer → `SessionAck::Ok` or `SessionAck::Err {code, message}` within **3 s**, after
-   authorizing with `authorize_exec` and spawning (so spawn errors come back as acks);
+   authorizing (`authorize_exec` / `authorize_service`) and spawning (so spawn errors come
+   back as acks). A service session runs the service's argv + allowed args, raw, with its
+   `cwd`/`env`, and from then on is identical to exec;
 3. caller → `ExecFrame::Stdin(bytes)…`, `StdinEof` (then finishes its send side);
    peer → `Stdout(bytes)` / `Stderr(bytes)` (≤ 64 KiB each) and exactly one terminal
    `Exit {code}` or `Error {code, message}` (e.g. `124` timeout).
 4. The caller resets/stops the stream when its CLI goes away → the peer kills the tree.
    `signal` frames are not implemented yet.
 
-Both ends log one timing line per session (`exec out`: ack / first byte / end / bytes;
-`exec in`: spawn / first output / pipes EOF / reaped / exit / out+err bytes) and append
-an audit line.
+Both ends log one timing line per session (`exec out` / `service out`: ack / first byte /
+end / bytes; `exec in` / `service in`: spawn / first output / pipes EOF / reaped / exit /
+out+err bytes) and append an audit line.
 
 Framing: length-prefixed **postcard** frames (D3); the PoC used raw bytes + newline
 header.
@@ -236,11 +279,15 @@ heartbeat. Retry backoff 250 ms doubling to 1.5 s. Receiving a hello: offline �
 backoff; online but a different `instance` (peer restarted) → drop and redial; online with
 `resume = true` → probe with an immediate heartbeat. A daemon that sees its wall clock
 jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true`.
+`Services` / `Services(Vec<ServiceInfo {name, kind, allow_args}>)` (v0.1 step 5) is the
+catalog fetch: the receiver answers with the services the sender may open; the caller
+sends it on its own ctl connection, so only an online peer can be asked (`255` otherwise).
 
 The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
-per connection (`Status {device}`, `PairInvite`, `PairJoin`, `Reload`), except `Exec {device, request}`: the daemon answers
-`ExecStarted` (or `Error {code, message}`) and the connection then carries the same
-`ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
+per connection (`Status {device}`, `PairInvite`, `PairJoin`, `Reload`,
+`Services {device}`), except `Exec {device, request}` and `Run {device, service, args}`:
+the daemon answers `ExecStarted` (or `Error {code, message}`) and the connection then
+carries the same `ExecFrame`s as the peer stream, relayed both ways. The CLI keeps the connection open
 after stdin EOF; closing it means "caller gone".
 
 ## 6. Security
@@ -253,8 +300,10 @@ after stdin EOF; closing it means "caller gone".
 - No listening HTTP, no exposed debug ports. UDP only for QUIC.
 - Audit log (JSONL) of every exec/service session: who, what, when, exit code.
   Implemented in v0.1 for exec: `<config dir>/audit.jsonl`, one line per session on both
-  ends: `{ts, dir: in|out, peer, cmd, shell?, raw, cwd?, env: [names only], exit,
-  error?, duration_ms}`. Refused and offline attempts are logged too. No rotation yet.
+  ends: `{ts, dir: in|out, peer, service?, cmd, shell?, raw, cwd?, env: [names only],
+  exit, error?, duration_ms}`. Service sessions (step 5) carry `service` and log the
+  spawned argv on the publishing side, the extra args on the calling side. Refused and
+  offline attempts are logged too. No rotation yet.
 - "Rejected unknown peer" warnings are rate-limited to one per peer id per minute.
 - Relays: default public iroh relays only carry encrypted traffic; self-hosted relay
   supported for full independence (later).
@@ -354,7 +403,7 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | | Scope | Done when |
 |---|---|---|
 | **v0.1** | daemon, pairing, presence, `status`, `exec` (non-interactive), `run`, `mcp`, config + grants, Win logon task, Linux systemd unit | Server ↔ Windows both ways; sleep test passes; an MCP works through `enishi mcp` in a sandboxed agent |
-| v0.2 | `shell` (PTY/ConPTY), `wake`, service catalog sync, audit log for services (exec audit is in v0.1), installers | daily driver replacing SSH→WSL |
+| v0.2 | `shell` (PTY/ConPTY), `wake`, service catalog sync (hello hash; v0.1 has on-demand `enishi services`), installers | daily driver replacing SSH→WSL |
 | v0.3 | macOS, self-hosted relay, pre-logon presence service | third device |
 | later | Android, file/clipboard services, Windows UI/browser services on top | — |
 
@@ -370,3 +419,4 @@ CI (GitHub Actions): fmt, clippy, tests on Linux + Windows, release builds for
 | **D6** | Sessions use a dedicated warm `enishi/stream/1` connection next to the ctl one (not extra streams on ctl), so bulk stdio (own congestion window) cannot delay heartbeats into false offlines, while presence still owns the link lifecycle. |
 | **D7** | Exec authorization, spawn and ack happen before any stdio flows; a spawn failure is an ack error (`126`/`127`), never a half-open session. |
 | **D8** | Pairing is daemon-to-daemon on its own ALPN `enishi/pair/1` with a one-time, TTL-bound, in-memory invite; it adds the peer to each side's config with no grants and hot-applies it. Config edits are applied with an explicit `enishi reload` (no file watcher). |
+| **D9** | Services are double-gated: `[services.S] allow` lists the peer **and** `[grants.<peer>] services` lists `S`; extra args only with `allow_args`. Unknown → `253`, refused → `254`. Services spawn argv directly (no shell) through the exec spawn path. enishi ships no services; the MCP shim is protocol-generic (JSON-RPC framing + handshake only). |
