@@ -772,8 +772,10 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
 
 /// [`run`] with the binary's [`Hooks`] (e.g. the remote updater).
 pub async fn run_with(cfg: Config, paths: Paths, key: SecretKey, hooks: Hooks) -> Result<()> {
-    // IPC first: fail fast (before binding UDP) if this instance is already running.
-    let mut listener = ipc::Listener::bind(&paths).await?;
+    // IPC first: fail fast (before binding UDP) if this instance is already running —
+    // but wait for one that is still shutting down (bug #12).
+    let t_start = Instant::now();
+    let mut listener = ipc::Listener::bind_waiting(&paths, ipc::TAKEOVER_WAIT).await?;
 
     let id = key.public();
     let instance = u64::from_le_bytes(SecretKey::generate().to_bytes()[..8].try_into()?);
@@ -786,18 +788,31 @@ pub async fn run_with(cfg: Config, paths: Paths, key: SecretKey, hooks: Hooks) -
         invites: Mutex::new(InviteBook::default()),
         log: RateLimit::new(REJECT_LOG_EVERY),
     });
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(key)
-        .alpns(vec![
-            ALPN_CTL.to_vec(),
-            ALPN_STREAM.to_vec(),
-            ALPN_PAIR.to_vec(),
-        ])
-        .hooks(AllowList(gate.clone()));
-    if let Some(port) = cfg.device.listen_port {
-        builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))?;
-    }
-    let ep = builder.bind().await.context("binding iroh endpoint")?;
+    let ep = loop {
+        let mut builder = Endpoint::builder(presets::N0)
+            .secret_key(key.clone())
+            .alpns(vec![
+                ALPN_CTL.to_vec(),
+                ALPN_STREAM.to_vec(),
+                ALPN_PAIR.to_vec(),
+            ])
+            .hooks(AllowList(gate.clone()));
+        if let Some(port) = cfg.device.listen_port {
+            builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))?;
+        }
+        match builder.bind().await {
+            Ok(ep) => break ep,
+            // The previous instance may release the fixed UDP port a moment after the
+            // IPC endpoint.
+            Err(e)
+                if cfg.device.listen_port.is_some() && t_start.elapsed() < ipc::TAKEOVER_WAIT =>
+            {
+                debug!("binding iroh endpoint: {e:#}; retrying");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(anyhow::Error::from(e).context("binding iroh endpoint")),
+        }
+    };
 
     let shared = Arc::new(Shared {
         device: cfg.device.name.clone(),

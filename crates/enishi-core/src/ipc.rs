@@ -105,6 +105,66 @@ where
 
 pub use sys::{ClientStream, Listener};
 
+/// How long `enishi up` waits for a previous instance that holds the IPC endpoint but no
+/// longer answers (it is shutting down: `systemctl restart`, `schtasks /End` + `/Run`,
+/// bug #12) before giving up.
+pub const TAKEOVER_WAIT: Duration = Duration::from_secs(10);
+/// A live daemon answers a status request well within this.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// An instance that answers is "already running" only if it keeps answering this long:
+/// `schtasks /End` returns before the old daemon even starts to exit (it was measured
+/// gone ~1 s later), so a `/Run` right after it first meets a fully healthy instance.
+pub const HEALTHY_CONFIRM: Duration = Duration::from_secs(3);
+
+impl Listener {
+    /// [`Listener::bind`], but when another instance holds the endpoint and does not
+    /// answer (shutting down), retry for up to `wait`. A daemon that keeps answering for
+    /// [`HEALTHY_CONFIRM`] is a live instance: "already running".
+    pub async fn bind_waiting(paths: &Paths, wait: Duration) -> Result<Listener> {
+        let t0 = std::time::Instant::now();
+        let mut waiting = false;
+        let mut healthy_since: Option<std::time::Instant> = None;
+        loop {
+            let err = match Listener::bind(paths).await {
+                Ok(l) => {
+                    if waiting || healthy_since.is_some() {
+                        tracing::info!(
+                            "previous instance gone after {:.1}s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(l);
+                }
+                Err(e) => e,
+            };
+            let probe = IpcRequest::Status { device: None };
+            if request_timeout(paths, &probe, PROBE_TIMEOUT).await.is_ok() {
+                let since = *healthy_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= HEALTHY_CONFIRM {
+                    return Err(err.context("a daemon of this instance is already running"));
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            healthy_since = None;
+            if t0.elapsed() >= wait {
+                return Err(err.context(format!(
+                    "the previous instance still holds the IPC endpoint without answering \
+                     after {wait:?}"
+                )));
+            }
+            if !waiting {
+                tracing::info!(
+                    "another instance holds the IPC endpoint but does not answer (shutting \
+                     down?); waiting up to {wait:?}"
+                );
+                waiting = true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
 #[cfg(unix)]
 mod sys {
     use std::path::PathBuf;
@@ -132,7 +192,7 @@ mod sys {
             let path = paths.ipc_socket();
             if path.exists() {
                 if UnixStream::connect(&path).await.is_ok() {
-                    bail!("a daemon is already running (socket {})", path.display());
+                    bail!("socket {} is in use", path.display());
                 }
                 std::fs::remove_file(&path)
                     .with_context(|| format!("removing stale socket {}", path.display()))?;
