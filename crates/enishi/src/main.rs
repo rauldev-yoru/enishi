@@ -11,7 +11,10 @@ use enishi_core::{
 use enishi_proto::{
     exit,
     ipc::{IpcRequest, IpcResponse, Presence, StatusReport},
+    session::ExecRequest,
 };
+
+mod exec;
 
 /// 縁 enishi — a native link between your devices.
 #[derive(Parser)]
@@ -41,22 +44,28 @@ enum Cmd {
     /// Peers, presence and latency (all peers, or only -d <device>)
     Status,
     /// Run a native command on the device
+    ///
+    /// The command words are joined into one command line for the device's shell
+    /// (PowerShell on Windows, $SHELL or sh elsewhere); --raw runs them as argv. stdin is
+    /// streamed, stdout/stderr stay separate, the exit code is the remote one. enishi's own
+    /// failures: 255 peer offline, 254 not allowed, 252 daemon not running, 124 timeout.
     Exec {
-        /// Shell to use (pwsh, powershell, cmd, bash, sh). Default: platform shell
-        #[arg(long)]
+        /// Shell on the device. Default: pwsh/powershell on Windows, $SHELL or sh elsewhere
+        #[arg(long, value_parser = ["pwsh", "powershell", "cmd", "bash", "sh"])]
         shell: Option<String>,
-        /// Spawn the process directly, without a shell
-        #[arg(long)]
+        /// Spawn the command directly, without a shell
+        #[arg(long, conflicts_with = "shell")]
         raw: bool,
+        /// Working directory on the device (a leading ~ is the device user's home)
         #[arg(long)]
         cwd: Option<String>,
         /// KEY=VALUE, repeatable
-        #[arg(long = "env")]
-        env: Vec<String>,
-        /// Seconds before the remote process is killed
-        #[arg(long)]
+        #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+        env: Vec<(String, String)>,
+        /// Seconds before the remote process tree is killed (exit 124)
+        #[arg(long, value_name = "SECS")]
         timeout: Option<u64>,
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
     /// Pipe local stdio to a service published by the device
@@ -117,18 +126,45 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Status => status(&paths, cli.device).await,
+        Cmd::Exec {
+            shell,
+            raw,
+            cwd,
+            env,
+            timeout,
+            command,
+        } => {
+            let request = ExecRequest {
+                command,
+                shell,
+                raw,
+                cwd,
+                env,
+                timeout_secs: timeout,
+            };
+            let c = exec::run(&paths, cli.device, request).await;
+            // Exit at once: a blocking stdin read must not keep the process alive, and the
+            // remote code may not fit an ExitCode (Windows).
+            std::process::exit(c)
+        }
         other => {
             let name = match other {
                 Cmd::Pair { .. } => "pair",
-                Cmd::Exec { .. } => "exec",
                 Cmd::Run { .. } => "run",
                 Cmd::Mcp { .. } => "mcp",
                 Cmd::Services => "services",
-                Cmd::Up | Cmd::Id | Cmd::Status => unreachable!(),
+                Cmd::Up | Cmd::Id | Cmd::Status | Cmd::Exec { .. } => unreachable!(),
             };
             eprintln!("enishi {name}: not implemented yet");
             Ok(code(exit::USAGE))
         }
+    }
+}
+
+fn parse_env(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((k, v)) if !k.is_empty() => Ok((k.into(), v.into())),
+        _ => Err(format!("expected KEY=VALUE, got {s:?}")),
     }
 }
 
@@ -157,6 +193,7 @@ async fn status(paths: &Paths, device: Option<String>) -> Result<ExitCode> {
             Ok(code(exit::DAEMON_DOWN))
         }
         Err(ClientError::Other(e)) => Err(e),
+        Ok(other) => anyhow::bail!("unexpected reply {other:?}"),
     }
 }
 
@@ -221,6 +258,48 @@ fn render_status(r: &StatusReport) -> String {
 mod tests {
     use super::*;
     use enishi_proto::ipc::PeerStatus;
+
+    #[test]
+    fn env_and_exec_args() {
+        assert_eq!(parse_env("A=1=2").unwrap(), ("A".into(), "1=2".into()));
+        assert_eq!(parse_env("A=").unwrap(), ("A".into(), "".into()));
+        assert!(parse_env("=1").is_err() && parse_env("A").is_err());
+        let cli = Cli::try_parse_from([
+            "enishi",
+            "-d",
+            "pc",
+            "exec",
+            "--env",
+            "K=V",
+            "--timeout",
+            "5",
+            "--",
+            "ls",
+            "-la",
+        ])
+        .unwrap();
+        assert_eq!(cli.device.as_deref(), Some("pc"));
+        match cli.cmd {
+            Cmd::Exec {
+                command,
+                env,
+                timeout,
+                raw,
+                ..
+            } => {
+                assert_eq!(command, vec!["ls", "-la"]);
+                assert_eq!(env, vec![("K".to_string(), "V".to_string())]);
+                assert_eq!(timeout, Some(5));
+                assert!(!raw);
+            }
+            _ => panic!("not exec"),
+        }
+        assert!(Cli::try_parse_from(["enishi", "exec", "--shell", "zsh", "--", "ls"]).is_err());
+        assert!(
+            Cli::try_parse_from(["enishi", "exec", "--raw", "--shell", "sh", "--", "ls"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["enishi", "exec"]).is_err());
+    }
 
     #[test]
     fn human_durations() {

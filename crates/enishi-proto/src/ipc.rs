@@ -3,15 +3,26 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::ExecRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcRequest {
     /// Presence of all peers, or only `device` when given.
     Status { device: Option<String> },
+    /// Run a command on `device` (default peer when `None`). On
+    /// [`IpcResponse::ExecStarted`] the connection switches to
+    /// [`crate::session::ExecFrame`]s in both directions.
+    Exec {
+        device: Option<String>,
+        request: ExecRequest,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcResponse {
     Status(StatusReport),
+    /// The peer acknowledged the exec session; stdio frames follow.
+    ExecStarted,
     /// `code` is one of [`crate::exit`].
     Error {
         code: i32,

@@ -49,5 +49,12 @@ mod tests {
     fn default_is_deny() {
         assert!(authorize_exec(&ExecPolicy::default(), &["ls".into()]).is_err());
         assert!(authorize_exec(&ExecPolicy::Flag(true), &["ls".into()]).is_ok());
+        assert!(authorize_exec(&ExecPolicy::Flag(false), &["ls".into()]).is_err());
+        // Rules are parsed but not enforced yet: fail closed, even for an allowed pattern.
+        let rules = ExecPolicy::Rules {
+            allow: vec!["*".into()],
+            deny: vec![],
+        };
+        assert!(authorize_exec(&rules, &["ls".into()]).is_err());
     }
 }

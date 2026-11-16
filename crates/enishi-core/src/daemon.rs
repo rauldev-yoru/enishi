@@ -6,6 +6,9 @@
 //! accepted only from configured peers (rejected during the handshake). A hello received
 //! from a peer skips our backoff, and a daemon that detects a wall-clock jump (resume
 //! from sleep) reconnects at once with `resume = true` so the peer does the same.
+//!
+//! Next to each ctl connection the daemon keeps a warm `enishi/stream/1` connection to the
+//! same peer, on which exec sessions are opened (see [`crate::session`]).
 
 use std::{
     collections::HashMap,
@@ -19,7 +22,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use enishi_proto::{
-    ALPN_CTL,
+    ALPN_CTL, ALPN_STREAM,
     ctl::{CtlRequest, CtlResponse, Hello},
     exit,
     ipc::{IpcRequest, IpcResponse, PeerStatus, Presence, StatusReport},
@@ -28,10 +31,19 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, presets},
 };
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Notify,
+};
 use tracing::{debug, info, warn};
 
-use crate::{config::Config, ipc, paths::Paths, wire};
+use crate::{
+    audit::{AUDIT_FILE, Audit},
+    config::{Config, Grant},
+    ipc,
+    paths::Paths,
+    session, wire,
+};
 
 pub const HEARTBEAT: Duration = Duration::from_millis(1500);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -49,20 +61,22 @@ const CLOSE_REJECTED: u32 = 1;
 const CLOSE_RESET: u32 = 2;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-struct PeerState {
-    presence: Presence,
+pub(crate) struct PeerState {
+    pub(crate) presence: Presence,
     since: Instant,
-    last_seen: Option<Instant>,
+    pub(crate) last_seen: Option<Instant>,
     rtt: Option<Duration>,
     last_error: Option<String>,
     /// `instance` from the hello on our current outgoing connection.
     remote_instance: Option<u64>,
     /// Set when the current connection must be dropped (peer restarted / resumed).
     force_reset: bool,
+    /// Warm `enishi/stream/1` connection (ours, outgoing) while online.
+    pub(crate) stream: Option<Connection>,
 }
 
-struct Peer {
-    name: String,
+pub(crate) struct Peer {
+    pub(crate) name: String,
     id: EndpointId,
     addr: EndpointAddr,
     state: Mutex<PeerState>,
@@ -74,7 +88,7 @@ struct Peer {
 }
 
 impl Peer {
-    fn state(&self) -> std::sync::MutexGuard<'_, PeerState> {
+    pub(crate) fn state(&self) -> std::sync::MutexGuard<'_, PeerState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -129,15 +143,32 @@ impl Peer {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     device: String,
     id: EndpointId,
     instance: u64,
     peers: Vec<Arc<Peer>>,
     by_id: HashMap<EndpointId, Arc<Peer>>,
+    cfg: Config,
+    pub(crate) audit: Audit,
 }
 
 impl Shared {
+    /// Grant for `peer`; absent = deny everything.
+    pub(crate) fn grant(&self, peer: &str) -> Grant {
+        self.cfg.grant(peer)
+    }
+
+    /// Resolve `-d/--device` (or `default_peer`) to a configured peer.
+    pub(crate) fn target(&self, device: Option<&str>) -> Result<Arc<Peer>, String> {
+        let name = self.cfg.target_peer(device).map_err(|e| format!("{e:#}"))?;
+        self.peers
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| format!("unknown device {name:?}"))
+    }
+
     fn hello(&self, resume: bool) -> Hello {
         Hello {
             device: self.device.clone(),
@@ -171,6 +202,10 @@ impl Shared {
                         .collect(),
                 })
             }
+            IpcRequest::Exec { .. } => IpcResponse::Error {
+                code: exit::USAGE,
+                message: "exec needs a streaming IPC connection".into(),
+            },
         }
     }
 }
@@ -259,6 +294,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
                     last_error: None,
                     remote_instance: None,
                     force_reset: false,
+                    stream: None,
                 }),
                 wake: Notify::new(),
                 resume: AtomicBool::new(false),
@@ -271,7 +307,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
 
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(key)
-        .alpns(vec![ALPN_CTL.to_vec()])
+        .alpns(vec![ALPN_CTL.to_vec(), ALPN_STREAM.to_vec()])
         .hooks(AllowList {
             ids: peers.iter().map(|p| p.id).collect(),
             log: RateLimit::new(REJECT_LOG_EVERY),
@@ -287,11 +323,13 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         instance,
         by_id: peers.iter().map(|p| (p.id, p.clone())).collect(),
         peers,
+        audit: Audit::new(paths.dir.join(AUDIT_FILE)),
+        cfg,
     });
     info!(
         device = %shared.device,
         id = %id,
-        port = ?cfg.device.listen_port,
+        port = ?shared.cfg.device.listen_port,
         ipc = %listener.display(),
         peers = shared.peers.len(),
         "daemon up"
@@ -310,7 +348,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
                 Ok(stream) => {
                     let sh = ipc_shared.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = ipc::serve_one(stream, |r| sh.handle_ipc(r)).await {
+                        if let Err(e) = serve_ipc(sh, stream).await {
                             debug!("ipc client: {e:#}");
                         }
                     });
@@ -335,6 +373,24 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         warn!("endpoint close timed out");
     }
     Ok(())
+}
+
+/// One CLI connection: a single request, or an exec session that streams.
+async fn serve_ipc<S>(sh: Arc<Shared>, mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req: IpcRequest =
+        tokio::time::timeout(ipc::CLIENT_TIMEOUT, wire::read_frame(&mut stream)).await??;
+    match req {
+        IpcRequest::Exec { device, request } => {
+            session::exec_client(sh, stream, device, request).await
+        }
+        other => {
+            let resp = sh.handle_ipc(other);
+            wire::write_frame(&mut stream, &resp).await
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -367,18 +423,24 @@ async fn ctl_request(conn: &Connection, req: &CtlRequest) -> Result<CtlResponse>
     wire::read_frame(&mut recv).await
 }
 
+/// Connect ctl (+ hello) and the warm stream connection.
 async fn dial(
     ep: &Endpoint,
     sh: &Shared,
     peer: &Peer,
     resume: bool,
-) -> Result<(Connection, Hello)> {
+) -> Result<(Connection, Connection, Hello)> {
     let conn = ep.connect(peer.addr.clone(), ALPN_CTL).await?;
-    match ctl_request(&conn, &CtlRequest::Hello(sh.hello(resume))).await? {
-        CtlResponse::Hello(h) => Ok((conn, h)),
+    let hello = match ctl_request(&conn, &CtlRequest::Hello(sh.hello(resume))).await? {
+        CtlResponse::Hello(h) => h,
         CtlResponse::Error { message } => bail!("peer refused hello: {message}"),
         other => bail!("unexpected hello reply {other:?}"),
-    }
+    };
+    let stream = ep
+        .connect(peer.addr.clone(), ALPN_STREAM)
+        .await
+        .context("stream connection")?;
+    Ok((conn, stream, hello))
 }
 
 async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
@@ -388,7 +450,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
         let resume = peer.resume.swap(false, Ordering::SeqCst);
         let t = Instant::now();
         let err = match tokio::time::timeout(CONNECT_TIMEOUT, dial(&ep, &sh, &peer, resume)).await {
-            Ok(Ok((conn, hello))) => {
+            Ok(Ok((conn, stream, hello))) => {
                 backoff = BACKOFF_MIN;
                 last_err.clear();
                 {
@@ -399,6 +461,7 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                     s.remote_instance = Some(hello.instance);
                     s.force_reset = false;
                     s.last_error = None;
+                    s.stream = Some(stream.clone());
                 }
                 info!(
                     peer = %peer.name,
@@ -408,10 +471,13 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
                     "ONLINE (connect {} ms)",
                     t.elapsed().as_millis()
                 );
-                let why = heartbeat(&conn, &peer).await;
+                let why = heartbeat(&conn, &stream, &peer).await;
                 conn.close(CLOSE_RESET.into(), b"reset");
+                // Sessions in flight on a dead link fail now instead of hanging.
+                stream.close(CLOSE_RESET.into(), b"reset");
                 {
                     let mut s = peer.state();
+                    s.stream = None;
                     s.presence = Presence::Offline;
                     s.since = Instant::now();
                     s.last_error = Some(why.clone());
@@ -447,11 +513,12 @@ async fn supervise(ep: Endpoint, sh: Arc<Shared>, peer: Arc<Peer>) {
 }
 
 /// Returns why the connection is considered lost.
-async fn heartbeat(conn: &Connection, peer: &Peer) -> String {
+async fn heartbeat(conn: &Connection, stream: &Connection, peer: &Peer) -> String {
     let mut seq: u64 = 0;
     loop {
         tokio::select! {
             e = conn.closed() => return format!("connection closed: {e}"),
+            e = stream.closed() => return format!("stream connection closed: {e}"),
             _ = peer.wake.notified() => {
                 if std::mem::take(&mut peer.state().force_reset) {
                     return "reset: restart or resume".into();
@@ -493,12 +560,16 @@ async fn accept_loop(ep: Endpoint, sh: Arc<Shared>) {
                 conn.close(CLOSE_REJECTED.into(), b"unknown peer");
                 return;
             };
-            if conn.alpn() != ALPN_CTL {
+            let alpn = conn.alpn().to_vec();
+            if alpn == ALPN_CTL {
+                debug!(peer = %peer.name, "incoming ctl connection");
+                serve_ctl(conn, sh, peer).await;
+            } else if alpn == ALPN_STREAM {
+                debug!(peer = %peer.name, "incoming stream connection");
+                session::serve_streams(conn, sh, peer).await;
+            } else {
                 conn.close(CLOSE_REJECTED.into(), b"unsupported alpn");
-                return;
             }
-            debug!(peer = %peer.name, "incoming ctl connection");
-            serve_ctl(conn, sh, peer).await;
         });
     }
 }

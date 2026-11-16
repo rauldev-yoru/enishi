@@ -30,11 +30,16 @@ impl std::fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+/// Connect to the local daemon (for streaming requests such as exec).
+pub async fn connect(paths: &Paths) -> Result<ClientStream, ClientError> {
+    sys::connect(paths)
+        .await
+        .map_err(|e| ClientError::DaemonDown(format!("{}: {e}", paths.ipc_display())))
+}
+
 /// Send one request to the local daemon.
 pub async fn request(paths: &Paths, req: &IpcRequest) -> Result<IpcResponse, ClientError> {
-    let mut stream = sys::connect(paths)
-        .await
-        .map_err(|e| ClientError::DaemonDown(format!("{}: {e}", paths.ipc_display())))?;
+    let mut stream = connect(paths).await?;
     let exchange = async {
         wire::write_frame(&mut stream, req).await?;
         wire::read_frame::<_, IpcResponse>(&mut stream).await
@@ -60,7 +65,7 @@ where
     Ok(())
 }
 
-pub use sys::Listener;
+pub use sys::{ClientStream, Listener};
 
 #[cfg(unix)]
 mod sys {
@@ -70,6 +75,8 @@ mod sys {
     use tokio::net::{UnixListener, UnixStream};
 
     use crate::paths::Paths;
+
+    pub type ClientStream = UnixStream;
 
     pub async fn connect(paths: &Paths) -> std::io::Result<UnixStream> {
         UnixStream::connect(paths.ipc_socket()).await
@@ -129,6 +136,8 @@ mod sys {
     use crate::paths::Paths;
 
     const ERROR_PIPE_BUSY: i32 = 231;
+
+    pub type ClientStream = NamedPipeClient;
 
     pub async fn connect(paths: &Paths) -> std::io::Result<NamedPipeClient> {
         let name = paths.ipc_pipe_name();
@@ -207,6 +216,7 @@ mod tests {
                     code: exit::NOT_ALLOWED,
                     message: format!("{device:?}"),
                 },
+                IpcRequest::Exec { .. } => unreachable!(),
             })
             .await
             .unwrap();
