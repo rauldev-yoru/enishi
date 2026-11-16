@@ -16,6 +16,7 @@ use enishi_proto::{
 };
 
 mod exec;
+mod manage;
 
 /// 縁 enishi — a native link between your devices.
 #[derive(Parser)]
@@ -93,6 +94,13 @@ enum Cmd {
     },
     /// List services the device publishes to us
     Services,
+    /// Manage the services this device publishes (edits enishi.toml, then reloads)
+    Service {
+        #[command(subcommand)]
+        action: manage::ServiceCmd,
+    },
+    /// Show or change what a peer may do here (edits enishi.toml, then reloads)
+    Grant(manage::GrantArgs),
 }
 
 #[derive(Subcommand)]
@@ -193,6 +201,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Services => services(&paths, cli.device).await,
         Cmd::Mcp { target, args } => mcp(paths, cli.device, target, args).await,
+        Cmd::Service { action } => manage::service(&paths, action).await,
+        Cmd::Grant(args) => manage::grant(&paths, args).await,
     }
 }
 

@@ -10,6 +10,7 @@
 
 pub mod cache;
 pub mod daemon;
+pub mod import;
 pub mod shim;
 
 pub use cache::Cache;
