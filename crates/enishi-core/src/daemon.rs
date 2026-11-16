@@ -48,7 +48,7 @@ use crate::{
     pair::{InviteBook, hint_addrs},
     pairing,
     paths::Paths,
-    policy::visible_services,
+    policy::{service_details, visible_services},
     session, wire,
 };
 
@@ -386,13 +386,53 @@ impl Shared {
 
     /// `enishi services`: ask the peer which services it publishes to us.
     pub(crate) async fn list_services(&self, device: Option<String>) -> IpcResponse {
+        match self.ask_peer(device, CtlRequest::Services).await {
+            Ok((peer, CtlResponse::Services(services))) => IpcResponse::Services {
+                device: peer,
+                services,
+            },
+            Ok((peer, other)) => IpcResponse::Error {
+                code: exit::PEER_OFFLINE,
+                message: format!("{peer}: unexpected reply {other:?}"),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// Details of one service the peer publishes to us (`None` from peers older than
+    /// 0.1.0, which do not know the request).
+    pub(crate) async fn service_details(
+        &self,
+        device: Option<String>,
+        service: String,
+    ) -> IpcResponse {
+        match self
+            .ask_peer(device, CtlRequest::ServiceDetails { name: service })
+            .await
+        {
+            Ok((_, CtlResponse::ServiceDetails(d))) => IpcResponse::ServiceDetails(d),
+            Ok((peer, other)) => IpcResponse::Error {
+                code: exit::PEER_OFFLINE,
+                message: format!("{peer}: unexpected reply {other:?}"),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// One ctl request to the target peer while it is online, bounded by the ack timeout.
+    /// Returns the peer's local name with the answer, or the IPC error to report.
+    async fn ask_peer(
+        &self,
+        device: Option<String>,
+        req: CtlRequest,
+    ) -> Result<(String, CtlResponse), IpcResponse> {
         let peer = match self.target(device.as_deref()) {
             Ok(p) => p,
             Err(message) => {
-                return IpcResponse::Error {
+                return Err(IpcResponse::Error {
                     code: exit::USAGE,
                     message,
-                };
+                });
             }
         };
         let conn = {
@@ -402,37 +442,27 @@ impl Shared {
                 _ => None,
             }
         };
-        let Some(conn) = conn else {
-            return IpcResponse::Error {
-                code: exit::PEER_OFFLINE,
-                message: format!("peer {} is offline", peer.name),
-            };
-        };
         let error = |message: String| IpcResponse::Error {
             code: exit::PEER_OFFLINE,
             message,
         };
-        match tokio::time::timeout(
-            session::ACK_TIMEOUT,
-            ctl_request(&conn, &CtlRequest::Services),
-        )
-        .await
-        {
-            Ok(Ok(CtlResponse::Services(services))) => IpcResponse::Services {
-                device: peer.name.clone(),
-                services,
-            },
-            Ok(Ok(CtlResponse::Error { message })) => error(format!("{}: {message}", peer.name)),
-            Ok(Ok(other)) => error(format!("{}: unexpected reply {other:?}", peer.name)),
-            Ok(Err(e)) => error(format!(
-                "{}: service list failed (peer too old?): {e:#}",
+        let Some(conn) = conn else {
+            return Err(error(format!("peer {} is offline", peer.name)));
+        };
+        match tokio::time::timeout(session::ACK_TIMEOUT, ctl_request(&conn, &req)).await {
+            Ok(Ok(CtlResponse::Error { message })) => {
+                Err(error(format!("{}: {message}", peer.name)))
+            }
+            Ok(Ok(resp)) => Ok((peer.name.clone(), resp)),
+            Ok(Err(e)) => Err(error(format!(
+                "{}: request failed (peer too old?): {e:#}",
                 peer.name
-            )),
-            Err(_) => error(format!(
+            ))),
+            Err(_) => Err(error(format!(
                 "{}: no answer within {:?}",
                 peer.name,
                 session::ACK_TIMEOUT
-            )),
+            ))),
         }
     }
 
@@ -475,6 +505,7 @@ impl Shared {
             | IpcRequest::Open { .. }
             | IpcRequest::Forward { .. }
             | IpcRequest::Services { .. }
+            | IpcRequest::ServiceDetails { .. }
             | IpcRequest::PairJoin { .. }
             | IpcRequest::Reload => IpcResponse::Error {
                 code: exit::USAGE,
@@ -699,6 +730,10 @@ where
         } => crate::forward::serve_cli(sh, stream, device, service, bind, port).await,
         IpcRequest::Services { device } => {
             let resp = sh.list_services(device).await;
+            wire::write_frame(&mut stream, &resp).await
+        }
+        IpcRequest::ServiceDetails { device, service } => {
+            let resp = sh.service_details(device, service).await;
             wire::write_frame(&mut stream, &resp).await
         }
         IpcRequest::PairJoin { code, name } => {
@@ -943,6 +978,9 @@ async fn serve_ctl(conn: Connection, sh: Arc<Shared>, peer: Arc<Peer>) {
                     CtlRequest::Ping { seq } => CtlResponse::Pong { seq },
                     CtlRequest::Services => {
                         CtlResponse::Services(visible_services(&sh.cfg(), &peer.name))
+                    }
+                    CtlRequest::ServiceDetails { name } => {
+                        CtlResponse::ServiceDetails(service_details(&sh.cfg(), &peer.name, &name))
                     }
                 };
                 wire::write_frame(&mut send, &resp).await?;

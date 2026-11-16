@@ -19,6 +19,10 @@ struct FakeState {
     seen: Vec<Value>,
     /// Kill switch of the current session (simulates losing the link).
     kill: Option<oneshot::Sender<()>>,
+    /// Servers opened from now on answer `initialize` only after this (slow start).
+    init_delay: Duration,
+    /// What [`Connector::startup_timeout`] reports (the service's setting).
+    startup_timeout: Option<Duration>,
 }
 
 #[derive(Clone, Default)]
@@ -31,6 +35,11 @@ impl Fake {
         if !on {
             s.kill.take(); // drop the live session too
         }
+    }
+    fn slow_start(&self, delay: Duration, timeout: Option<Duration>) {
+        let mut s = self.0.lock().unwrap();
+        s.init_delay = delay;
+        s.startup_timeout = timeout;
     }
     fn opens(&self) -> usize {
         self.0.lock().unwrap().opens
@@ -47,6 +56,9 @@ impl Fake {
 /// A minimal MCP server: requires `initialize` first, answers `tools/list`, echoes
 /// `tools/call`, never answers `slow`.
 impl Connector for Fake {
+    async fn startup_timeout(&self) -> Option<Duration> {
+        self.0.lock().unwrap().startup_timeout
+    }
     async fn open(&self) -> Result<Remote, OpenError> {
         let (tx, mut srv_rx) = mpsc::channel::<Value>(16);
         let (srv_tx, rx) = mpsc::channel::<Value>(16);
@@ -64,6 +76,7 @@ impl Connector for Fake {
         }
         let state = self.0.clone();
         let gen_ = self.opens();
+        let init_delay = self.0.lock().unwrap().init_delay;
         tokio::spawn(async move {
             let mut initialized = false;
             loop {
@@ -79,6 +92,10 @@ impl Connector for Fake {
                 let id = id.clone();
                 let reply = match method {
                     "initialize" => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(init_delay) => {}
+                            _ = &mut kill_rx => break,
+                        }
                         initialized = true;
                         json!({"jsonrpc":"2.0","id":id,"result":{
                             "protocolVersion":"2025-06-18",
@@ -395,4 +412,88 @@ async fn server_requests_and_client_responses_pass_through() {
     c.call(2, "tools/list", json!({})).await;
     c.close().await;
     assert_eq!(fake.seen_methods()[2], "<response>");
+}
+
+/// A reconnect to a server that starts slowly (cold `npx`): the replay waits for it,
+/// and meanwhile the client is never blocked.
+#[tokio::test]
+async fn slow_start_replay_answers_client_meanwhile() {
+    let fake = Fake::default();
+    fake.online(true);
+    let mut c = start(&fake, Cache::memory());
+    c.init(1).await;
+    c.call(2, "tools/list", json!({})).await; // cached
+    fake.online(false);
+    c.call(3, "tools/call", echo("down")).await;
+    // Back, but the new server needs 4 s to answer initialize (> START_HOLD).
+    fake.slow_start(Duration::from_secs(4), None);
+    fake.online(true);
+    let t0 = Instant::now();
+    c.send(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":echo("held")}))
+        .await;
+    // Cached methods and ping are answered at once while the replay waits.
+    let tools = c.call(5, "tools/list", json!({})).await;
+    assert_eq!(tools["result"]["tools"][0]["name"], "echo");
+    let p = c.call(6, "ping", json!({})).await;
+    assert_eq!(p["result"], json!({}));
+    assert!(
+        t0.elapsed() < Duration::from_millis(300),
+        "{:?}",
+        t0.elapsed()
+    );
+    // The held call fails after START_HOLD, telling why, without waiting for the server.
+    let e = c.recv().await;
+    assert_eq!(e["id"], 4);
+    assert!(err_msg(&e).contains("starting"), "{e}");
+    let waited = t0.elapsed();
+    assert!(waited >= START_HOLD && waited < START_HOLD + Duration::from_millis(500));
+    // The replay itself still completes on the same server: later calls go through.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let r = c.call(7, "tools/call", echo("up")).await;
+    assert_eq!(r["result"]["content"][0]["text"], "up", "{r}");
+    c.close().await;
+    assert_eq!(fake.opens(), 2, "no reopen: the first replay succeeded");
+}
+
+/// A call made while a quick replay runs is held and then sent: no error.
+#[tokio::test]
+async fn call_during_short_replay_is_held_then_sent() {
+    let fake = Fake::default();
+    fake.online(true);
+    let mut c = start(&fake, Cache::memory());
+    c.init(1).await;
+    fake.online(false);
+    c.call(2, "tools/call", echo("down")).await;
+    fake.slow_start(Duration::from_millis(800), None);
+    fake.online(true);
+    let r = c.call(3, "tools/call", echo("a")).await;
+    assert_eq!(r["result"]["content"][0]["text"], "a", "{r}");
+    c.close().await;
+}
+
+/// The service's startup_timeout bounds the replay; the next message retries.
+#[tokio::test]
+async fn replay_gives_up_after_service_startup_timeout() {
+    let fake = Fake::default();
+    fake.online(true);
+    let mut c = start(&fake, Cache::memory());
+    c.init(1).await;
+    fake.online(false);
+    c.call(2, "tools/call", echo("down")).await;
+    fake.slow_start(Duration::from_secs(3), Some(Duration::from_millis(500)));
+    fake.online(true);
+    let t0 = Instant::now();
+    let e = c.call(3, "tools/call", echo("x")).await;
+    assert!(err_msg(&e).contains("within 500ms"), "{e}");
+    assert!(
+        t0.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        t0.elapsed()
+    );
+    // Server is fast again: the next call reopens and replays successfully.
+    fake.slow_start(Duration::ZERO, None);
+    let r = c.call(4, "tools/call", echo("y")).await;
+    assert_eq!(r["result"]["content"][0]["text"], "y", "{r}");
+    c.close().await;
+    assert_eq!(fake.opens(), 3);
 }

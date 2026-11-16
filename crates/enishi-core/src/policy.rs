@@ -3,7 +3,7 @@
 
 use enishi_proto::{
     exit,
-    session::{ExecRequest, ServiceInfo},
+    session::{ExecRequest, ServiceDetails, ServiceInfo},
 };
 use serde::Deserialize;
 
@@ -112,6 +112,21 @@ pub fn visible_services(cfg: &Config, peer: &str) -> Vec<ServiceInfo> {
             port: s.target_port(),
         })
         .collect()
+}
+
+/// [`ServiceDetails`] of `name` for `peer`, if `peer` may see it (same rule as
+/// [`visible_services`]).
+pub fn service_details(cfg: &Config, peer: &str, name: &str) -> Option<ServiceDetails> {
+    let info = visible_services(cfg, peer)
+        .into_iter()
+        .find(|s| s.name == name)?;
+    let startup_timeout_ms = cfg.services[name]
+        .startup_timeout
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64);
+    Some(ServiceDetails {
+        info,
+        startup_timeout_ms,
+    })
 }
 
 /// The process for a service session: its argv (+ client args) spawned directly, never

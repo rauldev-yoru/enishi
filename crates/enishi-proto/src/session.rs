@@ -57,6 +57,17 @@ pub struct ServiceInfo {
     pub port: Option<u16>,
 }
 
+/// One service with the settings a consumer may need beyond [`ServiceInfo`]
+/// (`CtlRequest::ServiceDetails`). A separate message so that [`ServiceInfo`] — and the
+/// `Services` exchange with older peers — keeps its wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDetails {
+    pub info: ServiceInfo,
+    /// `[services.<name>] startup_timeout`: how long the service may take to answer its
+    /// first request after a start (e.g. an MCP server's `initialize`), in ms.
+    pub startup_timeout_ms: Option<u64>,
+}
+
 /// First frame of every session stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SessionKind {
@@ -173,6 +184,25 @@ mod tests {
             port: Some(3000),
         }]));
         rt(crate::ctl::CtlRequest::Services);
+        rt(crate::ctl::CtlRequest::ServiceDetails { name: "fs".into() });
+        rt(crate::ctl::CtlResponse::ServiceDetails(Some(
+            ServiceDetails {
+                info: ServiceInfo {
+                    name: "fs".into(),
+                    kind: ServiceKind::Mcp,
+                    allow_args: false,
+                    port: None,
+                },
+                startup_timeout_ms: Some(90_000),
+            },
+        )));
+        rt(crate::ctl::CtlResponse::ServiceDetails(None));
+        // Appending variants keeps the existing ones' encoding (older peers still decode
+        // `Services`): the discriminant of `Services` is unchanged.
+        assert_eq!(
+            encode(&crate::ctl::CtlRequest::Services).unwrap()[HEADER_LEN..],
+            [2u8]
+        );
         rt(SessionAck::Ok);
         rt(SessionAck::Err {
             code: crate::exit::NOT_ALLOWED,

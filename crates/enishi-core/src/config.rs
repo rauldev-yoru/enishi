@@ -93,6 +93,12 @@ pub struct ServiceConfig {
     /// Extra environment for the process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// How long the service may take to answer its first request after a start (e.g. an
+    /// MCP server started by `npx` right after boot). Seconds or `"90s"`/`"2m"`/`"500ms"`.
+    /// Consumers that wait on a start (the MCP shim's handshake replay) use it unless
+    /// their own `--startup-timeout` is given.
+    #[serde(default, deserialize_with = "opt_duration")]
+    pub startup_timeout: Option<std::time::Duration>,
 }
 
 impl ServiceConfig {
@@ -125,6 +131,50 @@ pub struct Grant {
     pub mcp: crate::policy::McpPolicy,
     #[serde(default)]
     pub services: Vec<String>,
+}
+
+/// Longest accepted `startup_timeout`.
+pub const MAX_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// A duration as plain seconds (`90`) or with a unit: `500ms`, `90s`, `2m`, `1h`.
+/// Must be non-zero and at most [`MAX_STARTUP_TIMEOUT`].
+pub fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
+    use std::time::Duration;
+    let s = s.trim();
+    let (num, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(i) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}: expected e.g. 90, 90s, 2m or 500ms"))?;
+    let d = match unit.trim() {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n.saturating_mul(60)),
+        "h" => Duration::from_secs(n.saturating_mul(3600)),
+        _ => return Err(format!("invalid duration {s:?}: units are ms, s, m, h")),
+    };
+    if d.is_zero() || d > MAX_STARTUP_TIMEOUT {
+        return Err(format!("duration {s:?} must be between 1ms and 1h"));
+    }
+    Ok(d)
+}
+
+fn opt_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<std::time::Duration>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Secs(u64),
+        Text(String),
+    }
+    let text = match Raw::deserialize(d)? {
+        Raw::Secs(n) => n.to_string(),
+        Raw::Text(t) => t,
+    };
+    parse_duration(&text)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 fn endpoint_id<'de, D: Deserializer<'de>>(d: D) -> Result<EndpointId, D::Error> {
@@ -176,6 +226,9 @@ impl Config {
         for (name, svc) in &self.services {
             check_name("service", name)?;
             if svc.kind == ServiceKind::Tcp {
+                if svc.startup_timeout.is_some() {
+                    bail!("service {name:?}: startup_timeout is for stdio/mcp services");
+                }
                 let Some(t) = &svc.target else {
                     bail!("service {name:?}: kind = \"tcp\" needs target = \"host:port\"");
                 };
@@ -509,6 +562,35 @@ exec = {{ allow = ["git *"], deny = ["rm *"] }}
         let (out3, _) = add_peer_to_toml("[device]\nname = \"x\"\n", "pc", &new, &[]).unwrap();
         let cfg3: Config = out3.parse().unwrap();
         assert_eq!(cfg3.peers.len(), 1);
+    }
+
+    #[test]
+    fn startup_timeout() {
+        use std::time::Duration;
+        let svc = |v: &str| {
+            format!(
+                "[device]\nname = \"x\"\n[services.fs]\ncommand = [\"a\"]\nkind = \"mcp\"\nstartup_timeout = {v}\n"
+            )
+        };
+        let get = |v: &str| {
+            svc(v)
+                .parse::<Config>()
+                .map(|c| c.services["fs"].startup_timeout)
+        };
+        assert_eq!(get("90").unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(get("\"90s\"").unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(get("\"2m\"").unwrap(), Some(Duration::from_secs(120)));
+        assert_eq!(get("\"500ms\"").unwrap(), Some(Duration::from_millis(500)));
+        assert_eq!(get("\"45\"").unwrap(), Some(Duration::from_secs(45)));
+        for bad in ["0", "\"0s\"", "\"2h\"", "\"soon\"", "\"5x\"", "-1", "1.5"] {
+            assert!(get(bad).is_err(), "{bad}");
+        }
+        let none: Config = "[device]\nname = \"x\"\n[services.fs]\ncommand = [\"a\"]\n"
+            .parse()
+            .unwrap();
+        assert_eq!(none.services["fs"].startup_timeout, None);
+        let tcp = "[device]\nname = \"x\"\n[services.w]\nkind = \"tcp\"\ntarget = \"h:1\"\nstartup_timeout = 5\n";
+        assert!(err(tcp).contains("startup_timeout"));
     }
 
     #[test]

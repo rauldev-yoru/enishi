@@ -24,12 +24,23 @@ pub enum CtlRequest {
     },
     /// The services the receiver publishes to the sender (only those it may open).
     Services,
+    /// Details of one service the receiver publishes to the sender (added in 0.1.0; older
+    /// peers drop the stream, which the sender treats as "no details").
+    ServiceDetails {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum CtlResponse {
     Hello(Hello),
-    Pong { seq: u64 },
-    Error { message: String },
+    Pong {
+        seq: u64,
+    },
+    Error {
+        message: String,
+    },
     Services(Vec<crate::session::ServiceInfo>),
+    /// `None`: no such service, or not open to the sender.
+    ServiceDetails(Option<crate::session::ServiceDetails>),
 }

@@ -160,7 +160,9 @@ enishi mcp config windows-home/filesystem --for hermes     # or claude | opencla
 
 While the device sleeps the agent still starts fine: `initialize` and `tools/list` come from a
 local cache, tool calls fail instantly with a clear error, and the session resumes transparently
-when the device is back. Walkthrough: [docs/examples/filesystem-mcp.md](docs/examples/filesystem-mcp.md).
+when the device is back. A server that starts slowly after a reboot (cold `npx`) gets up to 60 s
+to redo the handshake — raise it with `startup_timeout = "90s"` in the service's entry or
+`enishi mcp --startup-timeout 90s` — and the agent is answered meanwhile. Walkthrough: [docs/examples/filesystem-mcp.md](docs/examples/filesystem-mcp.md).
 
 ## Forward a TCP port
 

@@ -169,9 +169,14 @@ crate `enishi-mcp`, ported from the PoC):
   cache is an error, never a fabricated answer.
 - When a remote is opened and the client is already past `initialize` (mid-session
   reconnect, or initialized from cache), the shim first replays the client's
-  `initialize` with an internal id (`enishi-replay-N`, 15 s bound) plus
-  `notifications/initialized`; a client `notifications/initialized` that arrives right
-  then is not duplicated.
+  `initialize` with an internal id (`enishi-replay-N`) plus `notifications/initialized`;
+  a client `notifications/initialized` that arrives right then is not duplicated. The
+  replay waits up to the **startup timeout** — `enishi mcp --startup-timeout`, else the
+  service's `startup_timeout` (fetched with `ServiceDetails`), else 60 s — since a cold
+  `npx` right after a reboot can take tens of seconds. It never blocks the client: while
+  it runs, cached methods and `ping` are answered at once, other requests are held up
+  to 3 s (a quick replay stays invisible) and then fail with "the service is starting".
+  A replay that times out or errors drops the session; the next request starts over.
 - Requests in flight when the remote is lost get an error at once. On stdin EOF the shim
   waits up to 10 s for replies still in flight, then closes the service's stdin.
 - Batches (MCP 2025-03-26) are handled element by element.
@@ -282,6 +287,7 @@ command = ["node", "C:/…/server-filesystem/dist/index.js", "C:/Users/raulr/Pro
 kind = "mcp"                  # mcp | stdio (default) | tcp (with target = "host:port")
 allow = ["server"]            # peer names
 allow_args = false
+startup_timeout = "90s"       # optional (mcp/stdio): 90, "90s", "2m"; shim replay wait
 cwd = "~"                     # optional; default: the daemon's
 env = { NODE_ENV = "production" }   # optional
 
@@ -379,10 +385,14 @@ jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true
 `Services` / `Services(Vec<ServiceInfo {name, kind, allow_args}>)` (v0.1 step 5) is the
 catalog fetch: the receiver answers with the services the sender may open; the caller
 sends it on its own ctl connection, so only an online peer can be asked (`255` otherwise).
+`ServiceDetails {name}` / `ServiceDetails(Option<ServiceDetails {info, startup_timeout_ms}>)`
+(0.1.0) fetches one service's settings the same way (`None`: not visible to the sender);
+a peer older than 0.1.0 cannot decode it and drops the stream, which callers treat as
+"no details" (defaults apply).
 
 The CLI talks to the local daemon with the same framing: one `IpcRequest` / `IpcResponse`
 per connection (`Status {device}`, `PairInvite`, `PairJoin`, `Reload`,
-`Services {device}`), except `Forward {device, service, bind, port}` (answers `Forwarding
+`Services {device}`, `ServiceDetails {device, service}`), except `Forward {device, service, bind, port}` (answers `Forwarding
 {device, service, local}` then streams `Note`s until the CLI closes) and
 `Exec {device, request}`, `Run {device, service, args}` and `Open {device, header}` (a
 generic session carrier, used for transparent MCP):

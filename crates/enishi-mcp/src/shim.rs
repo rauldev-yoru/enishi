@@ -12,11 +12,19 @@
 //!   dropped;
 //! - when a remote is opened and the client is already past `initialize` (it initialized
 //!   against an earlier remote, or from the cache), the shim first replays the client's
-//!   `initialize` with an internal id plus `notifications/initialized`;
+//!   `initialize` with an internal id plus `notifications/initialized`. The replay waits
+//!   up to the service's startup timeout (default [`DEFAULT_STARTUP_TIMEOUT`]: a cold
+//!   `npx` after a reboot is slow) without blocking the client: meanwhile cached methods
+//!   and `ping` are answered at once, other requests are held for up to [`START_HOLD`]
+//!   (so a quick replay is invisible) and then failed;
 //! - when the remote is lost, requests in flight are failed;
 //! - on stdin EOF, replies still in flight are awaited (up to [`FLUSH_TIMEOUT`]).
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use tokio::{
@@ -37,8 +45,13 @@ pub const CACHED_METHODS: &[&str] = &[
 ];
 /// JSON-RPC error code of every error the shim generates (implementation-defined range).
 pub const ERROR_CODE: i64 = -32000;
-/// How long a replayed `initialize` may take (includes the remote server's start-up).
-pub const REPLAY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a replayed `initialize` may take (includes the remote server's start-up),
+/// unless the service (`startup_timeout` in its enishi.toml entry) or `enishi mcp
+/// --startup-timeout` says otherwise.
+pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// While a handshake replay is in progress, how long a request that cannot be answered
+/// from the cache waits for it before failing.
+pub const START_HOLD: Duration = Duration::from_secs(3);
 /// After stdin EOF, how long to wait for replies still in flight.
 pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -59,6 +72,11 @@ pub struct OpenError {
 
 pub trait Connector {
     fn open(&self) -> impl Future<Output = Result<Remote, OpenError>>;
+    /// How long the remote service may take to answer a replayed `initialize` (`None`:
+    /// [`DEFAULT_STARTUP_TIMEOUT`]). Asked on each replay, so config changes apply.
+    fn startup_timeout(&self) -> impl Future<Output = Option<Duration>> {
+        async { None }
+    }
 }
 
 struct Pending {
@@ -66,6 +84,20 @@ struct Pending {
     method: String,
     /// Cache key for the result, when cacheable.
     cache: Option<String>,
+}
+
+/// A handshake replay in progress on the current link.
+struct Replay {
+    rid: Value,
+    deadline: Instant,
+    timeout: Duration,
+}
+
+/// A client request waiting for the replay to finish.
+struct Held {
+    until: Instant,
+    method: String,
+    msg: Value,
 }
 
 struct Shim<C> {
@@ -79,6 +111,9 @@ struct Shim<C> {
     /// The client's `initialize` request, replayed on new remotes.
     init_req: Option<Value>,
     replays: u64,
+    /// Set while the current link replays the handshake (the link is not usable yet).
+    starting: Option<Replay>,
+    held: VecDeque<Held>,
     /// Why we are offline (for client errors); last state logged on stderr.
     reason: String,
     /// The device answered but refused the session (grant/allow/unknown service): not
@@ -116,6 +151,8 @@ enum Event {
     Client(Option<String>),
     Remote(Option<Value>),
     FlushTimeout,
+    /// A replay or hold deadline passed.
+    Timer,
 }
 
 async fn recv(link: &mut Option<Remote>) -> Option<Value> {
@@ -159,6 +196,8 @@ where
         pending: HashMap::new(),
         init_req: None,
         replays: 0,
+        starting: None,
+        held: VecDeque::new(),
         reason: "not connected yet".into(),
         refused: false,
         logged: None,
@@ -166,20 +205,25 @@ where
     let mut lines = BufReader::new(input).lines();
     let mut eof_at: Option<Instant> = None;
     loop {
-        if eof_at.is_some() && (shim.pending.is_empty() || shim.link.is_none()) {
+        if eof_at.is_some()
+            && ((shim.pending.is_empty() && shim.held.is_empty()) || shim.link.is_none())
+        {
             break;
         }
         let deadline = eof_at.map(|t| t + FLUSH_TIMEOUT);
+        let timer = shim.next_timer();
         let ev = tokio::select! {
             l = lines.next_line(), if eof_at.is_none() => Event::Client(l.ok().flatten()),
             m = recv(&mut shim.link) => Event::Remote(m),
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => Event::FlushTimeout,
+            _ = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now)), if timer.is_some() => Event::Timer,
         };
         match ev {
             Event::Client(Some(line)) => shim.on_client_line(&line).await,
             Event::Client(None) => eof_at = Some(Instant::now()),
-            Event::Remote(Some(v)) => shim.on_remote(v),
+            Event::Remote(Some(v)) => shim.on_remote(v).await,
             Event::Remote(None) => shim.lost("the remote session ended"),
+            Event::Timer => shim.on_timer(),
             Event::FlushTimeout => {
                 shim.lost("the client closed stdin and no reply came in time");
                 break;
@@ -239,8 +283,28 @@ impl<C: Connector> Shim<C> {
             replayed = self.connect(method != "initialize").await;
         }
         if replayed && method == "notifications/initialized" {
-            return; // the replay already sent it
+            return; // the replay sends it
         }
+        if self.starting.is_some() {
+            // The service is still starting: never make the client wait on it.
+            let Some(id) = id else { return }; // notifications are dropped
+            let cached = cache_key(&method, &msg).is_some_and(|k| self.cache.get(&k).is_some());
+            if cached || method == "ping" {
+                self.offline_reply(&method, Some(id), &msg);
+            } else {
+                self.held.push_back(Held {
+                    until: Instant::now() + START_HOLD,
+                    method,
+                    msg,
+                });
+            }
+            return;
+        }
+        self.forward(method, id, msg).await;
+    }
+
+    /// Send a client request/notification on the live link (or answer it offline).
+    async fn forward(&mut self, method: String, id: Option<Value>, msg: Value) {
         if let Some(link) = &self.link {
             if let Some(id) = &id {
                 let cache = cache_key(&method, &msg);
@@ -286,10 +350,11 @@ impl<C: Connector> Shim<C> {
         self.send(reply);
     }
 
-    /// Open a remote; replay the handshake when the client is already initialized.
-    /// Returns whether a replay happened.
+    /// Open a remote; start replaying the handshake when the client is already
+    /// initialized. Returns whether a replay was started (the link is then not usable
+    /// until it completes, see [`Shim::finish_replay`]).
     async fn connect(&mut self, may_replay: bool) -> bool {
-        let mut remote = match self.conn.open().await {
+        let remote = match self.conn.open().await {
             Ok(r) => r,
             Err(e) => {
                 self.reason = e.message.clone();
@@ -308,61 +373,119 @@ impl<C: Connector> Shim<C> {
                 return false;
             }
         };
-        let replay = may_replay && self.init_req.is_some();
-        if replay && let Err(why) = self.replay(&mut remote).await {
-            self.reason = why.clone();
-            self.note("replay", format!("offline: handshake replay failed: {why}"));
-            return false;
-        }
-        self.link = Some(remote);
         self.refused = false;
-        let text = if replay {
-            "online (handshake replayed)"
-        } else {
-            "online"
+        let Some(mut req) = self.init_req.clone().filter(|_| may_replay) else {
+            self.link = Some(remote);
+            self.note("online", "online".into());
+            return false;
         };
-        self.note("online", text.into());
-        replay
-    }
-
-    async fn replay(&mut self, remote: &mut Remote) -> Result<(), String> {
-        let mut req = self.init_req.clone().expect("checked by caller");
+        let timeout = self
+            .conn
+            .startup_timeout()
+            .await
+            .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         self.replays += 1;
         let rid = json!(format!("enishi-replay-{}", self.replays));
         req["id"] = rid.clone();
-        remote
-            .tx
-            .send(req)
-            .await
-            .map_err(|_| "remote closed".to_string())?;
-        let wait = async {
-            loop {
-                match remote.rx.recv().await {
-                    None => return Err("remote closed during the handshake".to_string()),
-                    Some(v) if is_response(&v) && v["id"] == rid => return Ok(v),
-                    // Notifications (logs) the server sends meanwhile reach the client.
-                    Some(v) => self.send(v),
-                }
-            }
+        if remote.tx.send(req).await.is_err() {
+            self.reason = "handshake replay failed: remote closed".into();
+            self.note("replay", format!("offline: {}", self.reason));
+            return false;
+        }
+        self.link = Some(remote);
+        self.starting = Some(Replay {
+            rid,
+            deadline: Instant::now() + timeout,
+            timeout,
+        });
+        self.reason = format!("the service is starting (handshake replay, up to {timeout:?})");
+        self.note(
+            "starting",
+            format!("connected, replaying the handshake (waiting up to {timeout:?})"),
+        );
+        true
+    }
+
+    /// The replayed `initialize` was answered: complete the handshake, then send the
+    /// requests held meanwhile.
+    async fn finish_replay(&mut self, resp: Value) {
+        let Some(replay) = self.starting.take() else {
+            return;
         };
-        let resp = tokio::time::timeout(REPLAY_TIMEOUT, wait)
-            .await
-            .map_err(|_| format!("no initialize reply within {REPLAY_TIMEOUT:?}"))??;
         if let Some(e) = resp.get("error") {
-            return Err(format!("initialize failed: {e}"));
+            return self.fail_start(format!("handshake replay failed: initialize failed: {e}"));
         }
         if let Some(r) = resp.get("result") {
             self.cache.put("initialize", r.clone());
         }
         let done = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        remote
-            .tx
-            .send(done)
-            .await
-            .map_err(|_| "remote closed".to_string())
+        let sent = match &self.link {
+            Some(link) => link.tx.send(done).await.is_ok(),
+            None => false,
+        };
+        if !sent {
+            return self.fail_start("handshake replay failed: remote closed".into());
+        }
+        let took = replay
+            .timeout
+            .saturating_sub(replay.deadline.saturating_duration_since(Instant::now()));
+        self.note(
+            "online",
+            format!("online (handshake replayed in {:.1}s)", took.as_secs_f64()),
+        );
+        for h in std::mem::take(&mut self.held) {
+            let id = h.msg.get("id").cloned();
+            self.forward(h.method, id, h.msg).await;
+        }
     }
 
-    fn on_remote(&mut self, v: Value) {
+    /// The replay did not complete: drop the link and fail the held requests; the next
+    /// client message tries again.
+    fn fail_start(&mut self, why: String) {
+        self.starting = None;
+        self.link = None;
+        self.reason = why.clone();
+        self.note("replay", format!("offline: {why}"));
+        for h in std::mem::take(&mut self.held) {
+            let id = h.msg.get("id").cloned();
+            self.offline_reply(&h.method, id, &h.msg);
+        }
+    }
+
+    fn next_timer(&self) -> Option<Instant> {
+        let hold = self.held.front().map(|h| h.until);
+        let replay = self.starting.as_ref().map(|r| r.deadline);
+        match (hold, replay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn on_timer(&mut self) {
+        let now = Instant::now();
+        if let Some(r) = &self.starting
+            && r.deadline <= now
+        {
+            let t = r.timeout;
+            return self.fail_start(format!(
+                "handshake replay failed: no initialize reply within {t:?} \
+                 (raise the service's startup_timeout or --startup-timeout)"
+            ));
+        }
+        while self.held.front().is_some_and(|h| h.until <= now) {
+            let h = self.held.pop_front().expect("checked");
+            let id = h.msg.get("id").cloned();
+            self.offline_reply(&h.method, id, &h.msg);
+        }
+    }
+
+    async fn on_remote(&mut self, v: Value) {
+        if let Some(r) = &self.starting {
+            if is_response(&v) && v["id"] == r.rid {
+                return self.finish_replay(v).await;
+            }
+            // Notifications (logs) the server sends while starting reach the client.
+        }
         if is_response(&v)
             && let Some(p) = self.pending.remove(&id_key(&v["id"]))
             && let (Some(k), Some(r)) = (p.cache, v.get("result"))
@@ -374,6 +497,9 @@ impl<C: Connector> Shim<C> {
 
     /// The remote is gone: fail what is in flight; the next message re-opens.
     fn lost(&mut self, why: &str) {
+        if self.starting.is_some() {
+            return self.fail_start(format!("handshake replay failed: {why}"));
+        }
         if self.link.take().is_none() && self.pending.is_empty() {
             return;
         }

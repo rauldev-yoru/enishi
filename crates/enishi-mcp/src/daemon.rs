@@ -3,10 +3,12 @@
 //! `SessionKind::Mcp` for a transparent-mode command), with stdout split into JSON-RPC
 //! lines and the service's stderr copied to ours (agents log the shim's stderr).
 
+use std::time::Duration;
+
 use enishi_core::{ipc, paths::Paths, wire};
 use enishi_proto::{
     exit,
-    ipc::IpcRequest,
+    ipc::{IpcRequest, IpcResponse},
     session::{ExecFrame, ExecRequest, MAX_CHUNK, SessionKind},
 };
 use serde_json::Value;
@@ -16,11 +18,15 @@ use crate::shim::{Connector, OpenError, Remote};
 
 /// Lines longer than this (no newline yet) are dropped rather than buffered forever.
 const MAX_LINE: usize = 64 << 20;
+/// Bound on asking the daemon for the service's details before a replay.
+const DETAILS_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct DaemonConnector {
     pub paths: Paths,
     pub device: String,
     pub target: Target,
+    /// `--startup-timeout`: overrides the service's `startup_timeout`.
+    pub startup_timeout: Option<Duration>,
 }
 
 /// What to open on the device.
@@ -43,6 +49,26 @@ impl Target {
 }
 
 impl Connector for DaemonConnector {
+    async fn startup_timeout(&self) -> Option<Duration> {
+        if self.startup_timeout.is_some() {
+            return self.startup_timeout;
+        }
+        let Target::Service { name, .. } = &self.target else {
+            return None;
+        };
+        let req = IpcRequest::ServiceDetails {
+            device: Some(self.device.clone()),
+            service: name.clone(),
+        };
+        // Best effort: an older daemon/peer, or no setting, means the default.
+        match ipc::request_timeout(&self.paths, &req, DETAILS_TIMEOUT).await {
+            Ok(IpcResponse::ServiceDetails(Some(d))) => {
+                d.startup_timeout_ms.map(Duration::from_millis)
+            }
+            _ => None,
+        }
+    }
+
     async fn open(&self) -> Result<Remote, OpenError> {
         let device = Some(self.device.clone());
         let req = match &self.target {

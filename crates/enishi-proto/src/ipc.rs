@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::{ExecRequest, ServiceInfo, SessionKind};
+use crate::session::{ExecRequest, ServiceDetails, ServiceInfo, SessionKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IpcRequest {
@@ -46,6 +46,12 @@ pub enum IpcRequest {
         bind: Option<String>,
         port: Option<u16>,
     },
+    /// Details of the service `service` published by `device` (added in 0.1.0: an older
+    /// daemon closes the connection instead of answering).
+    ServiceDetails {
+        device: Option<String>,
+        service: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -79,6 +85,9 @@ pub enum IpcResponse {
     },
     /// A log line for the CLI (e.g. a forwarded connection refused while the peer is down).
     Note(String),
+    /// Answer to [`IpcRequest::ServiceDetails`]; `None` when the device does not publish
+    /// that service to us.
+    ServiceDetails(Option<ServiceDetails>),
 }
 
 /// A pairing that completed on this device.

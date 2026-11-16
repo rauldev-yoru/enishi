@@ -59,6 +59,10 @@ pub struct McpSpec {
     /// Transparent mode: working directory on the device
     #[arg(long)]
     pub cwd: Option<String>,
+    /// How long the server may take to answer the replayed handshake after a reconnect
+    /// (90, 90s, 2m; default: the service's startup_timeout, else 60s)
+    #[arg(long, value_parser = enishi_core::config::parse_duration)]
+    pub startup_timeout: Option<std::time::Duration>,
     /// Extra args for a published service, or the whole command in transparent mode
     #[arg(last = true)]
     pub args: Vec<String>,
@@ -69,6 +73,7 @@ pub struct McpSpec {
 pub struct Resolved {
     pub device: String,
     pub target: Target,
+    pub startup_timeout: Option<std::time::Duration>,
 }
 
 impl McpSpec {
@@ -91,6 +96,7 @@ impl McpSpec {
                         name,
                         args: self.args.clone(),
                     },
+                    startup_timeout: self.startup_timeout,
                 })
             }
             None => {
@@ -111,6 +117,7 @@ impl McpSpec {
                         env: self.env.clone(),
                         ..Default::default()
                     }),
+                    startup_timeout: self.startup_timeout,
                 })
             }
         }
@@ -121,6 +128,9 @@ impl Resolved {
     /// Args for a fully explicit `enishi …` invocation of this (device pinned).
     pub fn cli_args(&self) -> Vec<String> {
         let mut a = vec!["mcp".to_string()];
+        if let Some(t) = self.startup_timeout {
+            a.extend(["--startup-timeout".to_string(), format_duration(t)]);
+        }
         match &self.target {
             Target::Service { name, args } => {
                 a.push(format!("{}/{name}", self.device));
@@ -149,6 +159,15 @@ impl Resolved {
             Target::Service { name, .. } => name.clone(),
             Target::Command(r) => snippet::name_for_command(&r.command),
         }
+    }
+}
+
+/// `d` as `parse_duration` reads it back (whole seconds when exact, else ms).
+fn format_duration(d: std::time::Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -235,6 +254,7 @@ pub async fn run(
         paths,
         device: r.device,
         target: r.target,
+        startup_timeout: r.startup_timeout,
     };
     enishi_mcp::run(conn, cache, label, tokio::io::stdin(), tokio::io::stdout()).await?;
     // stdin is at EOF and replies are flushed; don't wait on runtime teardown.
@@ -334,6 +354,39 @@ mod tests {
         assert!(a.spec.resolve(d.as_deref(), None).is_err());
         let (d, a) = parse(&["--", "npx", "x"]);
         assert!(a.spec.resolve(d.as_deref(), None).is_err());
+    }
+
+    #[test]
+    fn startup_timeout_flag() {
+        use std::time::Duration;
+        let (d, a) = parse(&["pc/fs", "--startup-timeout", "90"]);
+        let r = a.spec.resolve(d.as_deref(), None).unwrap();
+        assert_eq!(r.startup_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(
+            r.cli_args(),
+            v(&["mcp", "--startup-timeout", "90s", "pc/fs"])
+        );
+        let (d, a) = parse(&[
+            "config",
+            "-d",
+            "w",
+            "--startup-timeout",
+            "1500ms",
+            "--",
+            "x",
+        ]);
+        let Some(McpCmd::Config { spec, .. }) = a.action else {
+            panic!("not config")
+        };
+        let r = spec.resolve(d.as_deref(), None).unwrap();
+        assert_eq!(
+            r.cli_args(),
+            v(&["mcp", "--startup-timeout", "1500ms", "-d", "w", "--", "x"])
+        );
+        let (_, a) = parse(&["pc/fs"]);
+        assert_eq!(a.spec.startup_timeout, None);
+        assert!(T::try_parse_from(["x", "pc/fs", "--startup-timeout", "0"]).is_err());
+        assert!(T::try_parse_from(["x", "pc/fs", "--startup-timeout", "soon"]).is_err());
     }
 
     #[test]
