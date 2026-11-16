@@ -68,6 +68,13 @@ pub(crate) const CLOSE_REJECTED: u32 = 1;
 const CLOSE_RESET: u32 = 2;
 /// The peer was removed from the config (reload) or replaced.
 const CLOSE_REMOVED: u32 = 3;
+/// This daemon is stopping.
+const CLOSE_SHUTDOWN: u32 = 4;
+/// On shutdown, how long to let the endpoint drain after every connection was closed.
+/// The CONNECTION_CLOSE frames go out right away, so peers see us offline at once;
+/// waiting the full QUIC draining period (3 PTO of the slowest path, seconds over a
+/// relay) only delays the exit.
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) struct PeerState {
@@ -215,6 +222,8 @@ pub(crate) struct Shared {
     pub(crate) audit: Audit,
     /// Running `[forwards.*]` listeners, by name, with the config they were started from.
     forwards: Mutex<HashMap<String, (ForwardConfig, tokio::task::AbortHandle)>>,
+    /// Incoming peer connections being served, by `stable_id` (closed on shutdown).
+    incoming: Mutex<HashMap<usize, Connection>>,
 }
 
 impl Shared {
@@ -225,6 +234,24 @@ impl Shared {
 
     pub(crate) fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.cfg.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Close every peer connection (ours and theirs) with `code`/`reason`, so peers learn
+    /// why at once.
+    fn close_all(&self, code: u32, reason: &[u8]) {
+        for peer in self.peers() {
+            let s = peer.state();
+            for c in [&s.ctl, &s.stream].into_iter().flatten() {
+                c.close(code.into(), reason);
+            }
+        }
+        for c in self.lock_incoming().values() {
+            c.close(code.into(), reason);
+        }
+    }
+
+    fn lock_incoming(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Connection>> {
+        self.incoming.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Snapshot of the current peers.
@@ -649,6 +676,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         gate,
         cfg_edit: tokio::sync::Mutex::new(()),
         forwards: Mutex::new(HashMap::new()),
+        incoming: Mutex::new(HashMap::new()),
     });
     let n_peers = cfg.peers.len();
     // Starts a supervisor per peer and fills the allow-list.
@@ -689,12 +717,21 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         _ = ipc_task => {}
         _ = shutdown_signal() => info!("shutting down"),
     }
-    // Closing the endpoint sends CONNECTION_CLOSE, so peers see us offline immediately.
-    if tokio::time::timeout(Duration::from_secs(2), ep.close())
-        .await
-        .is_err()
-    {
-        warn!("endpoint close timed out");
+    let t = Instant::now();
+    shared.close_all(CLOSE_SHUTDOWN, b"shutdown");
+    // Closing sends CONNECTION_CLOSE at once, so peers see us offline immediately; the
+    // endpoint's close then waits for every connection to drain, which is bounded here.
+    match tokio::time::timeout(SHUTDOWN_DRAIN, ep.close()).await {
+        Ok(()) => info!("stopped ({} ms)", t.elapsed().as_millis()),
+        Err(_) => {
+            info!(
+                "stopped ({} ms; connections closed, not waiting for them to drain)",
+                t.elapsed().as_millis()
+            );
+            // The process is exiting: dropping the half-closed endpoint would only log
+            // "Endpoint dropped without calling `Endpoint::close`" while aborting it.
+            std::mem::forget(ep);
+        }
     }
     Ok(())
 }
@@ -941,7 +978,11 @@ async fn accept_loop(ep: Endpoint, sh: Arc<Shared>) {
                 conn.close(CLOSE_REJECTED.into(), b"unknown peer");
                 return;
             };
+            let key = conn.stable_id();
+            sh.lock_incoming().insert(key, conn.clone());
+            let serving = sh.clone();
             let serve = async {
+                let sh = serving;
                 if alpn == ALPN_CTL {
                     debug!(peer = %peer.name, "incoming ctl connection");
                     serve_ctl(conn.clone(), sh, peer.clone()).await;
@@ -957,6 +998,7 @@ async fn accept_loop(ep: Endpoint, sh: Arc<Shared>) {
                 // Unpaired/replaced while connected: drop its links (and sessions).
                 _ = peer.until_retired() => conn.close(CLOSE_REMOVED.into(), b"removed"),
             }
+            sh.lock_incoming().remove(&key);
         });
     }
 }

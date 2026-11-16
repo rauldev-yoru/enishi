@@ -382,8 +382,12 @@ request frame + one response frame on a fresh bi-stream: `Hello {device, version
 instance, resume}` first, then `Ping {seq}` / `Pong {seq}` every 1.5 s (1.5 s timeout;
 rtt = ping round trip). Unknown ids are rejected right after the TLS handshake. A
 connection close from the peer marks it offline at once; a silent peer after one missed
-heartbeat. Retry backoff 250 ms doubling to 1.5 s. Receiving a hello: offline → skip the
-backoff; online but a different `instance` (peer restarted) → drop and redial; online with
+heartbeat. A stopping daemon closes every peer connection (both directions) with code 4
+`shutdown` first — the peer logs `closed by peer: shutdown (code 4)` within a ms — then
+gives the endpoint at most 500 ms to drain instead of the full QUIC draining period
+(3 PTO; with a peer offline the pending dials alone kept the old 2 s close timeout).
+Retry backoff 250 ms doubling to 1.5 s. Receiving a hello: offline → skip the backoff;
+online but a different `instance` (peer restarted) → drop and redial; online with
 `resume = true` → probe with an immediate heartbeat. A daemon that sees its wall clock
 jump > 5 s on a 1 s tick drops its links and redials at once with `resume = true`.
 `Services` / `Services(Vec<ServiceInfo {name, kind, allow_args}>)` (v0.1 step 5) is the
