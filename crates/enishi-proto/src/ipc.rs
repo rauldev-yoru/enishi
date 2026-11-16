@@ -52,6 +52,14 @@ pub enum IpcRequest {
         device: Option<String>,
         service: String,
     },
+    /// `enishi -d <device> update`: ask the device to update itself (added in 0.1.1).
+    Update {
+        device: Option<String>,
+        version: Option<String>,
+        from_file: Option<String>,
+    },
+    /// The device's version and last update status (added in 0.1.1).
+    UpdateStatus { device: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,6 +96,17 @@ pub enum IpcResponse {
     /// Answer to [`IpcRequest::ServiceDetails`]; `None` when the device does not publish
     /// that service to us.
     ServiceDetails(Option<ServiceDetails>),
+    /// The device started a detached updater named `id`.
+    UpdateStarted {
+        device: String,
+        id: String,
+    },
+    /// Answer to [`IpcRequest::UpdateStatus`]; `status` is the device's `update.json`.
+    UpdateStatus {
+        device: String,
+        version: String,
+        status: Option<String>,
+    },
 }
 
 /// A pairing that completed on this device.

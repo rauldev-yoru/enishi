@@ -37,6 +37,9 @@ pub struct Entry<'a> {
     /// Transparent MCP session (`enishi mcp -d dev -- cmd…`): `cmd` is the server argv.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mcp: bool,
+    /// Remote update request (`enishi -d dev update`): `cmd` describes the source.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub update: bool,
     pub cmd: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<&'a str>,
@@ -62,6 +65,7 @@ impl<'a> Entry<'a> {
             peer,
             service: None,
             mcp: false,
+            update: false,
             cmd: &req.command,
             shell: req.shell.as_deref(),
             raw: req.raw,
@@ -87,6 +91,7 @@ impl<'a> Entry<'a> {
             peer,
             service: Some(name),
             mcp: false,
+            update: false,
             cmd,
             shell: None,
             raw: true,
@@ -95,6 +100,15 @@ impl<'a> Entry<'a> {
             exit: None,
             error: None,
             duration_ms: 0,
+        }
+    }
+
+    /// A remote update request; `cmd` describes it (`["update", "--version", "v0.1.1"]`).
+    pub fn update(dir: Direction, peer: &'a str, cmd: &'a [String]) -> Entry<'a> {
+        Entry {
+            update: true,
+            service: None,
+            ..Entry::service(dir, peer, "", cmd)
         }
     }
 

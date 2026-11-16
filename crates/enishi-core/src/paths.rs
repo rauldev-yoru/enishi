@@ -7,6 +7,10 @@ use anyhow::{Context, Result, bail};
 pub const CONFIG_FILE: &str = "enishi.toml";
 pub const IDENTITY_FILE: &str = "identity.key";
 pub const LOG_FILE: &str = "enishi.log";
+/// Status of the last `enishi update` (JSON), next to the config.
+pub const UPDATE_STATUS_FILE: &str = "update.json";
+/// Log of the detached updater.
+pub const UPDATE_LOG_FILE: &str = "update.log";
 #[cfg(unix)]
 const SOCKET_FILE: &str = "enishi.sock";
 
@@ -64,6 +68,16 @@ impl Paths {
     /// `enishi logs`.
     pub fn log_file(&self) -> PathBuf {
         self.dir.join(LOG_FILE)
+    }
+
+    /// Status file of the last update (`enishi update`), read by remote `update --status`.
+    pub fn update_status(&self) -> PathBuf {
+        self.dir.join(UPDATE_STATUS_FILE)
+    }
+
+    /// Log of the detached updater.
+    pub fn update_log(&self) -> PathBuf {
+        self.dir.join(UPDATE_LOG_FILE)
     }
 
     /// Unix socket of the local daemon: `$XDG_RUNTIME_DIR/enishi.sock`, falling back to the

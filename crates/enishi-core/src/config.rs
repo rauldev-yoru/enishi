@@ -131,6 +131,11 @@ pub struct Grant {
     pub mcp: crate::policy::McpPolicy,
     #[serde(default)]
     pub services: Vec<String>,
+    /// May the peer update this device's installed enishi (`enishi -d <this> update`)?
+    /// Independent of `exec` (design D16). Added in 0.1.1: an older enishi refuses a config
+    /// that sets it.
+    #[serde(default)]
+    pub update: bool,
 }
 
 /// Longest accepted `startup_timeout`.

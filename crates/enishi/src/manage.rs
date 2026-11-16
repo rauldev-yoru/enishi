@@ -90,6 +90,12 @@ pub struct GrantArgs {
     pub mcp: bool,
     #[arg(long)]
     pub no_mcp: bool,
+    /// Let the peer update enishi on this device (`enishi -d <this> update`); exec does not
+    /// imply it
+    #[arg(long, overrides_with = "no_update")]
+    pub update: bool,
+    #[arg(long)]
+    pub no_update: bool,
     /// Grant a service: added to the grant and the peer to the service's allow list
     #[arg(long = "service", value_name = "SERVICE")]
     pub services: Vec<String>,
@@ -340,6 +346,11 @@ pub async fn grant(paths: &Paths, args: GrantArgs) -> Result<ExitCode> {
             (_, true) => Some(false),
             _ => None,
         },
+        update: match (args.update, args.no_update) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         services: args.services,
         revoke: args.revoke,
     };
@@ -383,9 +394,10 @@ fn render_grant(cfg: &Config, peer: &str) -> String {
         _ => "no",
     };
     format!(
-        "peer {peer}\n  exec:     {}\n  mcp:      {}\n  services: {}\n",
+        "peer {peer}\n  exec:     {}\n  mcp:      {}\n  update:   {}\n  services: {}\n",
         show(&g.exec),
         show(&g.mcp),
+        if g.update { "yes" } else { "no" },
         if services.is_empty() {
             "none".into()
         } else {

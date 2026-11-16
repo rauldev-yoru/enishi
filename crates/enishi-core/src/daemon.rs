@@ -41,7 +41,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    audit::{AUDIT_FILE, Audit},
+    audit::{AUDIT_FILE, Audit, Direction, Entry},
     config::ForwardConfig,
     config::{Config, Grant, PeerConfig},
     ipc,
@@ -206,6 +206,26 @@ impl Peer {
     }
 }
 
+/// What a remote peer asked for with `enishi -d <this> update` (already authorized).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateOrder {
+    /// Local name of the requesting peer.
+    pub peer: String,
+    pub version: Option<String>,
+    pub from_file: Option<String>,
+}
+
+/// Starts the detached updater for an [`UpdateOrder`] and returns its id at once (the
+/// update itself restarts this daemon). Installing is the binary's business, not the
+/// daemon's, so the `enishi` binary registers it.
+pub type UpdateHook = Arc<dyn Fn(UpdateOrder) -> Result<String, String> + Send + Sync>;
+
+/// Behaviour the daemon delegates to the binary that runs it.
+#[derive(Clone, Default)]
+pub struct Hooks {
+    pub update: Option<UpdateHook>,
+}
+
 pub(crate) struct Shared {
     pub(crate) device: String,
     pub(crate) id: EndpointId,
@@ -224,6 +244,7 @@ pub(crate) struct Shared {
     forwards: Mutex<HashMap<String, (ForwardConfig, tokio::task::AbortHandle)>>,
     /// Incoming peer connections being served, by `stable_id` (closed on shutdown).
     incoming: Mutex<HashMap<usize, Connection>>,
+    hooks: Hooks,
 }
 
 impl Shared {
@@ -493,6 +514,105 @@ impl Shared {
         }
     }
 
+    /// `enishi -d <device> update`: ask the peer to start its detached updater.
+    pub(crate) async fn update_peer(
+        &self,
+        device: Option<String>,
+        version: Option<String>,
+        from_file: Option<String>,
+    ) -> IpcResponse {
+        let what = update_cmd(version.as_deref(), from_file.as_deref());
+        let name = self.target(device.as_deref()).ok().map(|p| p.name.clone());
+        let t0 = Instant::now();
+        let req = CtlRequest::Update { version, from_file };
+        let resp = self.ask_peer(device, req).await;
+        if let Some(name) = &name {
+            let error = match &resp {
+                Err(IpcResponse::Error { message, .. }) => Some(message.as_str()),
+                _ => None,
+            };
+            self.audit
+                .record(&Entry::update(Direction::Out, name, &what).finish(
+                    None,
+                    error,
+                    t0.elapsed(),
+                ));
+        }
+        match resp {
+            Ok((device, CtlResponse::UpdateStarted { id })) => {
+                IpcResponse::UpdateStarted { device, id }
+            }
+            Ok((peer, other)) => IpcResponse::Error {
+                code: exit::PEER_OFFLINE,
+                message: format!("{peer}: unexpected reply {other:?}"),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// The peer's version and update status.
+    pub(crate) async fn peer_update_status(&self, device: Option<String>) -> IpcResponse {
+        match self.ask_peer(device, CtlRequest::UpdateStatus).await {
+            Ok((device, CtlResponse::UpdateStatus { version, status })) => {
+                IpcResponse::UpdateStatus {
+                    device,
+                    version,
+                    status,
+                }
+            }
+            Ok((peer, other)) => IpcResponse::Error {
+                code: exit::PEER_OFFLINE,
+                message: format!("{peer}: unexpected reply {other:?}"),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// A peer asked to update this device: authorize (D16), audit, start the updater.
+    fn serve_update(
+        &self,
+        peer: &str,
+        version: Option<String>,
+        from_file: Option<String>,
+    ) -> CtlResponse {
+        let what = update_cmd(version.as_deref(), from_file.as_deref());
+        let t0 = Instant::now();
+        let result = crate::policy::authorize_update(&self.grant(peer))
+            .map_err(str::to_string)
+            .and_then(|()| match &self.hooks.update {
+                Some(hook) => hook(UpdateOrder {
+                    peer: peer.to_string(),
+                    version,
+                    from_file,
+                }),
+                None => Err("this daemon cannot update itself (no updater)".into()),
+            });
+        let error = result.as_ref().err().map(String::as_str);
+        self.audit
+            .record(&Entry::update(Direction::In, peer, &what).finish(None, error, t0.elapsed()));
+        match result {
+            Ok(id) => {
+                info!(peer, %id, "update requested by peer: updater started");
+                CtlResponse::UpdateStarted { id }
+            }
+            Err(message) => {
+                warn!(peer, "update refused: {message}");
+                CtlResponse::Error { message }
+            }
+        }
+    }
+
+    /// This daemon's version and its `update.json`, if any.
+    fn update_status(&self, peer: &str) -> CtlResponse {
+        if let Err(m) = crate::policy::authorize_update(&self.grant(peer)) {
+            return CtlResponse::Error { message: m.into() };
+        }
+        CtlResponse::UpdateStatus {
+            version: VERSION.into(),
+            status: std::fs::read_to_string(self.paths.update_status()).ok(),
+        }
+    }
+
     fn hello(&self, resume: bool) -> Hello {
         Hello {
             device: self.device.clone(),
@@ -533,6 +653,8 @@ impl Shared {
             | IpcRequest::Forward { .. }
             | IpcRequest::Services { .. }
             | IpcRequest::ServiceDetails { .. }
+            | IpcRequest::Update { .. }
+            | IpcRequest::UpdateStatus { .. }
             | IpcRequest::PairJoin { .. }
             | IpcRequest::Reload => IpcResponse::Error {
                 code: exit::USAGE,
@@ -631,8 +753,25 @@ impl EndpointHooks for AllowList {
     }
 }
 
+/// How an update request is described in the audit log.
+fn update_cmd(version: Option<&str>, from_file: Option<&str>) -> Vec<String> {
+    let mut cmd = vec!["update".to_string()];
+    if let Some(v) = version {
+        cmd.extend(["--version".into(), v.into()]);
+    }
+    if let Some(f) = from_file {
+        cmd.extend(["--from-file".into(), f.into()]);
+    }
+    cmd
+}
+
 /// Run the daemon until SIGINT/SIGTERM.
 pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
+    run_with(cfg, paths, key, Hooks::default()).await
+}
+
+/// [`run`] with the binary's [`Hooks`] (e.g. the remote updater).
+pub async fn run_with(cfg: Config, paths: Paths, key: SecretKey, hooks: Hooks) -> Result<()> {
     // IPC first: fail fast (before binding UDP) if this instance is already running.
     let mut listener = ipc::Listener::bind(&paths).await?;
 
@@ -677,6 +816,7 @@ pub async fn run(cfg: Config, paths: Paths, key: SecretKey) -> Result<()> {
         cfg_edit: tokio::sync::Mutex::new(()),
         forwards: Mutex::new(HashMap::new()),
         incoming: Mutex::new(HashMap::new()),
+        hooks,
     });
     let n_peers = cfg.peers.len();
     // Starts a supervisor per peer and fills the allow-list.
@@ -771,6 +911,18 @@ where
         }
         IpcRequest::ServiceDetails { device, service } => {
             let resp = sh.service_details(device, service).await;
+            wire::write_frame(&mut stream, &resp).await
+        }
+        IpcRequest::Update {
+            device,
+            version,
+            from_file,
+        } => {
+            let resp = sh.update_peer(device, version, from_file).await;
+            wire::write_frame(&mut stream, &resp).await
+        }
+        IpcRequest::UpdateStatus { device } => {
+            let resp = sh.peer_update_status(device).await;
             wire::write_frame(&mut stream, &resp).await
         }
         IpcRequest::PairJoin { code, name } => {
@@ -1024,6 +1176,10 @@ async fn serve_ctl(conn: Connection, sh: Arc<Shared>, peer: Arc<Peer>) {
                     CtlRequest::ServiceDetails { name } => {
                         CtlResponse::ServiceDetails(service_details(&sh.cfg(), &peer.name, &name))
                     }
+                    CtlRequest::Update { version, from_file } => {
+                        sh.serve_update(&peer.name, version, from_file)
+                    }
+                    CtlRequest::UpdateStatus => sh.update_status(&peer.name),
                 };
                 wire::write_frame(&mut send, &resp).await?;
                 send.finish()?;

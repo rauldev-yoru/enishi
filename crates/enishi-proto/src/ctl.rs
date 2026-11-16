@@ -29,6 +29,16 @@ pub enum CtlRequest {
     ServiceDetails {
         name: String,
     },
+    /// Update the receiver's installed enishi (added in 0.1.1; needs the receiver's
+    /// `[grants.<sender>] update = true`). `version`: a release tag (default: newest);
+    /// `from_file`: a binary already on the receiver. The receiver acks with
+    /// [`CtlResponse::UpdateStarted`] at once; a detached updater then restarts its daemon.
+    Update {
+        version: Option<String>,
+        from_file: Option<String>,
+    },
+    /// The receiver's version and its last update status (added in 0.1.1).
+    UpdateStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,4 +53,14 @@ pub enum CtlResponse {
     Services(Vec<crate::session::ServiceInfo>),
     /// `None`: no such service, or not open to the sender.
     ServiceDetails(Option<crate::session::ServiceDetails>),
+    /// The detached updater was started; `id` names it in the status file.
+    UpdateStarted {
+        id: String,
+    },
+    /// `status`: the receiver's `update.json` as JSON text (`None`: never updated). Kept as
+    /// text so the status format can grow without a protocol change.
+    UpdateStatus {
+        version: String,
+        status: Option<String>,
+    },
 }

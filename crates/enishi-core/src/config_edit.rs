@@ -173,6 +173,8 @@ pub struct GrantEdit {
     pub exec: Option<bool>,
     /// Transparent MCP (`mcp = true|false`), see [`crate::policy::authorize_mcp`].
     pub mcp: Option<bool>,
+    /// Remote update (`update = true|false`), see [`crate::policy::authorize_update`].
+    pub update: Option<bool>,
     /// Grant these services: added to `[grants.<peer>] services` **and** the peer added to
     /// each service's `allow` (both gates of D9 in one command).
     pub services: Vec<String>,
@@ -237,7 +239,11 @@ pub fn edit_grant(text: &str, peer: &str, edit: &GrantEdit) -> Result<(String, C
     let g = grants[peer]
         .as_table_mut()
         .with_context(|| format!("[grants.{peer}] must be a table"))?;
-    for (key, want) in [("exec", edit.exec), ("mcp", edit.mcp)] {
+    for (key, want) in [
+        ("exec", edit.exec),
+        ("mcp", edit.mcp),
+        ("update", edit.update),
+    ] {
         let Some(want) = want else { continue };
         let current = g.get(key).and_then(Item::as_bool);
         if current != Some(want) {
@@ -380,6 +386,7 @@ mod tests {
         let edit = GrantEdit {
             exec: Some(false),
             mcp: Some(true),
+            update: Some(true),
             services: vec!["old".into(), "fs".into()],
             revoke: vec![],
         };
@@ -395,6 +402,12 @@ mod tests {
         assert!(!changes.iter().any(|c| c.contains("[services.fs] allow")));
         assert!(crate::policy::authorize_service(&cfg, "lap", "old", &[]).is_ok());
         assert_eq!(g.mcp, ExecPolicy::Flag(true));
+        assert!(g.update);
+        assert!(!cfg.grant("srv").update, "default deny");
+        assert!(
+            changes.contains(&"[grants.lap] update = true".to_string()),
+            "{changes:?}"
+        );
         assert!(
             changes.contains(&"[grants.lap] mcp = true".to_string()),
             "{changes:?}"

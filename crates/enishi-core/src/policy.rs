@@ -49,6 +49,16 @@ pub fn authorize_mcp(policy: &McpPolicy, _command: &[String]) -> Result<(), &'st
     }
 }
 
+/// The single check for `enishi -d <this> update` from `peer` (design D16): its own
+/// `[grants.<peer>] update = true`, default deny; `exec` does not imply it.
+pub fn authorize_update(grant: &crate::config::Grant) -> Result<(), &'static str> {
+    if grant.update {
+        Ok(())
+    } else {
+        Err("update not granted to this peer (on this device: enishi grant <peer> --update)")
+    }
+}
+
 /// What actually runs for a transparent MCP session: the argv spawned directly, never a
 /// shell, never a timeout (the session lives as long as the client).
 pub fn mcp_command(mut req: ExecRequest) -> ExecRequest {
@@ -154,6 +164,18 @@ mod tests {
     struct G {
         #[serde(default)]
         exec: ExecPolicy,
+    }
+
+    #[test]
+    fn update_is_its_own_grant() {
+        let g: crate::config::Grant = toml::from_str("exec = true\nmcp = true").unwrap();
+        assert!(
+            authorize_update(&g).is_err(),
+            "exec/mcp do not imply update (D16)"
+        );
+        let g: crate::config::Grant = toml::from_str("update = true").unwrap();
+        assert!(authorize_update(&g).is_ok());
+        assert!(authorize_update(&crate::config::Grant::default()).is_err());
     }
 
     #[test]
