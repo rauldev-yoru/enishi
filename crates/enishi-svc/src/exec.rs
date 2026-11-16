@@ -600,7 +600,11 @@ mod tree {
     use tokio::process::Child;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
-        System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject},
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
     };
 
     /// A job object holding the child and everything it starts (assigned right after
@@ -620,6 +624,16 @@ mod tree {
                 if job.is_null() {
                     return Tree(std::ptr::null_mut());
                 }
+                // Let a child leave the job on purpose (CREATE_BREAKAWAY_FROM_JOB): the
+                // detached updater must outlive this exec and the daemon (bug #11).
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
                 match child.raw_handle() {
                     Some(h) if AssignProcessToJobObject(job, h as HANDLE) != 0 => Tree(job),
                     _ => {
