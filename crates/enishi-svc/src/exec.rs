@@ -29,6 +29,9 @@ use tokio::{
 pub const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Shells accepted by `--shell`.
+/// Carries a `--shell cmd` line to the inner cmd (see [`plan`]).
+const CMD_LINE_VAR: &str = "ENISHI_CMD_LINE";
+
 pub const SHELLS: &[&str] = &["pwsh", "powershell", "cmd", "bash", "sh"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +109,8 @@ pub struct Plan {
     /// Appended verbatim to the Windows command line (cmd.exe's own quoting rules); a
     /// plain extra argument elsewhere.
     pub raw_tail: Option<String>,
+    /// Extra environment for the process, applied after the request's `env`.
+    pub env: Vec<(String, String)>,
 }
 
 /// A request that can't be started; `code` is one of [`exit`].
@@ -149,6 +154,7 @@ pub fn plan(req: &ExecRequest, default: impl FnOnce() -> Shell) -> Result<Plan, 
             program: req.command[0].clone(),
             args: req.command[1..].to_vec(),
             raw_tail: None,
+            env: Vec::new(),
         });
     }
     let shell = match &req.shell {
@@ -169,20 +175,45 @@ pub fn plan(req: &ExecRequest, default: impl FnOnce() -> Shell) -> Result<Plan, 
             .chain([line.clone()])
             .collect(),
         raw_tail: None,
+        env: Vec::new(),
     };
     let posix = |program: &str| Plan {
         program: program.into(),
         args: vec!["-c".into(), line.clone()],
         raw_tail: None,
+        env: Vec::new(),
     };
     Ok(match shell {
         Shell::Pwsh => ps("pwsh"),
         Shell::Powershell => ps("powershell"),
         // `/s` makes cmd strip exactly the outer quotes and run the rest verbatim.
+        //
+        // Output encoding: cmd's built-ins (echo, dir, ver…) and most console programs
+        // encode for the console *output code page*, which defaults to the OEM page
+        // (cp850/cp437…), so "Versión" arrived as `Versi\xa2n` and `€` as `?` (lost).
+        // Rejected: `cmd /u` (built-ins only, and UTF-16, so mixed encodings in one
+        // stream); decoding OEM ourselves (MultiByteToWideChar(CP_OEMCP)) can't recover
+        // characters outside the OEM page and would corrupt programs that already write
+        // UTF-8 (git, python, cargo); `chcp 65001 & <line>` in the same cmd (measured: cmd
+        // caches the code page per parsed line, so the line's built-ins still emit OEM).
+        // So an outer cmd switches its (hidden, per-session — CREATE_NO_WINDOW) console
+        // to UTF-8 and only then starts the real cmd, which inherits the console and
+        // runs the line verbatim. The line travels in an environment variable read with
+        // delayed expansion (`!VAR!`, expanded after the outer cmd has parsed its own
+        // line), so the outer cmd never interprets its quotes, `&`, `|`, `%`… The inner
+        // cmd has default settings (delayed expansion off, `%VAR%` sees the caller's
+        // env), and its exit code is the outer one's. chcp failing (no console) is
+        // ignored. Cost: chcp + a second cmd.exe (measured ~30 ms: `echo hi` 55 ms vs
+        // 25 ms for a bare `cmd /c`), acceptable for a non-default shell. Both are by
+        // absolute path so a `cmd.exe`/`chcp.com` in --cwd can't hijack them.
         Shell::Cmd => Plan {
             program: "cmd".into(),
-            args: vec!["/d".into(), "/s".into(), "/c".into()],
-            raw_tail: Some(format!("\"{line}\"")),
+            args: vec!["/d".into(), "/v:on".into(), "/s".into(), "/c".into()],
+            raw_tail: Some(format!(
+                "\"%SystemRoot%\\System32\\chcp.com 65001 >nul 2>&1 & \
+                 \"%SystemRoot%\\System32\\cmd.exe\" /d /s /c !{CMD_LINE_VAR}!\""
+            )),
+            env: vec![(CMD_LINE_VAR.into(), format!("\"{line}\""))],
         },
         Shell::Bash => posix("bash"),
         Shell::Sh => posix("sh"),
@@ -269,6 +300,7 @@ pub fn spawn(req: &ExecRequest) -> Result<Running, ExecError> {
         cmd.current_dir(dir);
     }
     cmd.envs(req.env.iter().map(|(k, v)| (k, v)))
+        .envs(plan.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -588,8 +620,15 @@ mod tests {
         r.shell = Some("cmd".into());
         let p = plan(&r, || unreachable!()).unwrap();
         assert_eq!(p.program, "cmd");
-        assert_eq!(p.args, vec!["/d", "/s", "/c"]);
-        assert_eq!(p.raw_tail.as_deref(), Some("\"dir /b\""));
+        assert_eq!(p.args, vec!["/d", "/v:on", "/s", "/c"]);
+        assert_eq!(
+            p.raw_tail.as_deref(),
+            Some(
+                "\"%SystemRoot%\\System32\\chcp.com 65001 >nul 2>&1 & \
+                 \"%SystemRoot%\\System32\\cmd.exe\" /d /s /c !ENISHI_CMD_LINE!\""
+            )
+        );
+        assert_eq!(p.env, vec![("ENISHI_CMD_LINE".into(), "\"dir /b\"".into())]);
     }
 
     #[test]
@@ -697,6 +736,23 @@ mod tests {
             assert_eq!(s, "a b|c|");
         }
         assert_eq!(out.end, End::Exited(0));
+    }
+
+    /// `--shell cmd` output must be UTF-8, not the OEM code page (cp850 turned
+    /// "Versión" into `Versi\xa2n`); operators and the exit code must survive the
+    /// chcp prefix.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cmd_output_is_utf8() {
+        let mut r = req(&["echo versíón ñ€ \"a|b\" %OS% !x! && (echo x | findstr y || exit /b 3)"]);
+        r.shell = Some("cmd".into());
+        let (o, e, out) = run_local(r, b"").await;
+        assert_eq!(
+            String::from_utf8(o.clone()).map_err(|_| o).unwrap().trim(),
+            "versíón ñ€ \"a|b\" Windows_NT !x!"
+        );
+        assert!(e.is_empty(), "{}", String::from_utf8_lossy(&e));
+        assert_eq!(out.end, End::Exited(3));
     }
 
     #[tokio::test]

@@ -93,7 +93,14 @@ As implemented (v0.1 step 3):
 
 - Shell mode joins the command words with spaces into one command line: Windows →
   `pwsh` if on PATH else `powershell`, both `-NoProfile -NoLogo -NonInteractive -Command
-  <line>`; `--shell cmd` → `cmd /d /s /c "<line>"` (passed verbatim); unix → `$SHELL` (else
+  <line>`; `--shell cmd` → `cmd /d /s /c "<line>"` run by an outer `cmd /d /v:on /s /c
+  "chcp.com 65001 >nul 2>&1 & cmd.exe /d /s /c !ENISHI_CMD_LINE!"` (both by
+  `%SystemRoot%\System32` path; the line, quoted, travels in `ENISHI_CMD_LINE` and is
+  passed verbatim). The outer cmd switches the session's hidden console to UTF-8 so
+  built-ins and console programs stop emitting the OEM code page (cp850 garbled accents
+  and lost `€`); a single `chcp 65001 & <line>` does not work because cmd caches the code
+  page per parsed line. Cost ≈30 ms per call (two extra short processes). Legacy tools that ignore the console code page (e.g. `findstr`
+  matching non-ASCII) are unaffected. unix → `$SHELL` (else
   `/bin/sh`) `-c <line>`. `--raw` spawns argv directly (`--raw` and `--shell` conflict).
 - `--cwd` must exist on the device (a leading `~` is the device user's home); `--env`
   adds to the daemon's environment. Windows children get `CREATE_NO_WINDOW`.
