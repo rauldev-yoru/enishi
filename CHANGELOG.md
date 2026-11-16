@@ -4,6 +4,44 @@ All notable changes to enishi are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] — 2026-11-16
+
+### Fixed
+
+- **#12** `schtasks /End` + `/Run` (or any quick stop/start) could leave a device with **no
+  daemon**: `/End` returns before the old daemon exits, the new one found it still holding
+  the IPC pipe, said "already running" and exited. `enishi up` now waits (≤ 10 s) for an
+  instance that holds the endpoint without answering, and only reports "already running"
+  for one that keeps answering for 3 s.
+- **#13** A link drop (device asleep, Wi-Fi change) killed the remote service process of a
+  published stdio/MCP service (`enishi mcp`, transparent MCP, `enishi run`) and the shim
+  respawned it on reconnect, losing its state — Playwright MCP `--extension` lost the
+  agent's tab and opened a new "Welcome" tab each time. Sessions are now **resumable**
+  (design D18): the serving device keeps the process for `detach_ttl`, buffers its output
+  and the caller reattaches the same process when the link is back; no handshake replay.
+
+### Added
+
+- `enishi restart [--name N]`: restarts the installed daemon (Linux `systemctl --user
+  restart`; Windows: stop the task, wait for the installed `enishiw.exe` — by exact path —
+  to exit, kill it by path after 10 s, run the task) and waits until it answers, printing
+  its version. Exit 1 when not installed; `-d <device>` is refused with an `exec` hint.
+- `detach_ttl` (per `[services.*]` of kind stdio/mcp, and in `[device]` as the default and
+  for transparent MCP sessions): how long a session's process outlives a lost link,
+  default `10m`, max `24h`, `0` = killed with the link as before.
+- Audit events `detach`, `resume`, `expire`, `lost` (fields `event`, `detail`).
+- `enishi mcp`: while the link is down, requests in flight wait up to 30 s for their reply
+  (delivered after the resume, exactly once); new requests fail fast; cached methods and
+  `ping` are answered.
+
+### Notes
+
+- Resuming needs both devices on 0.1.2; with an older peer sessions behave as in 0.1.1.
+- A session ends as before (process tree killed) when the TTL expires, when the 8 MiB
+  replay buffer overflows while detached, or when the caller goes away (closed client,
+  caller daemon stopped). `exec` sessions are not resumable.
+- `enishi up` against a healthy instance now takes 3 s to report "already running".
+
 ## [0.1.1] — 2026-11-16
 
 ### Fixed
@@ -118,5 +156,6 @@ stdio services, MCP servers and TCP ports published across it, built for devices
   are untested.
 - x86_64 Linux and Windows only; macOS, ARM and phones are not supported yet.
 
+[0.1.2]: https://github.com/rauldev-yoru/enishi/releases/tag/v0.1.2
 [0.1.1]: https://github.com/rauldev-yoru/enishi/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rauldev-yoru/enishi/releases/tag/v0.1.0
