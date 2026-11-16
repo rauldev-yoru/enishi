@@ -29,27 +29,28 @@ daemon runs in the user's session (not session 0), so UI-capable tools work.
 
 ## Install
 
-Per user, no admin rights. Download the binary for your OS from the
-[latest release](https://github.com/rauldev-yoru/enishi/releases/latest) (or build it:
-`cargo build --release -p enishi`), check it against `SHA256SUMS`, then let it install itself:
+Per user, no admin rights. One command downloads the latest release, verifies its checksum and
+runs `enishi install` (binary on your PATH + autostart + daemon started):
 
 ```bash
-enishi install          # copy to ~/.local/bin (Linux) or %LOCALAPPDATA%\Programs\enishi (Windows),
-                        # register autostart, start the daemon
-enishi status
-enishi logs -f          # the daemon's log (enishi.log in the config dir)
-```
-
-One-liners doing exactly that (download, verify the checksum, install):
-
-```bash
-# Linux x86_64
-cd "$(mktemp -d)" && u=https://github.com/rauldev-yoru/enishi/releases/latest/download && curl -fsSL -O "$u/enishi-x86_64-unknown-linux-gnu" -O "$u/SHA256SUMS" && sha256sum --ignore-missing -c SHA256SUMS && chmod +x enishi-x86_64-unknown-linux-gnu && ./enishi-x86_64-unknown-linux-gnu install
+# Linux (x86_64)
+curl -fsSL https://raw.githubusercontent.com/rauldev-yoru/enishi/main/install.sh | sh
 ```
 
 ```powershell
-# Windows x86_64 (PowerShell)
-$u='https://github.com/rauldev-yoru/enishi/releases/latest/download'; $f="$env:TEMP\enishi-setup.exe"; iwr "$u/enishi-x86_64-pc-windows-msvc.exe" -OutFile $f; iwr "$u/SHA256SUMS" -OutFile "$f.sums"; if ((Get-FileHash $f).Hash -ne (Select-String windows "$f.sums").Line.Split(' ')[0]) { throw 'checksum mismatch' }; & $f install
+# Windows (PowerShell, no admin)
+irm https://raw.githubusercontent.com/rauldev-yoru/enishi/main/install.ps1 | iex
+# from cmd:
+powershell -NoProfile -c "irm https://raw.githubusercontent.com/rauldev-yoru/enishi/main/install.ps1 | iex"
+```
+
+Pin a version with `ENISHI_VERSION=v0.1.0`. Prefer to do it by hand? Download the binary for your
+OS from [Releases](https://github.com/rauldev-yoru/enishi/releases), check it against
+`SHA256SUMS`, and run it with `install`. Or build it: `cargo build --release -p enishi`.
+
+```bash
+enishi status
+enishi logs -f          # the daemon's log
 ```
 
 (The checksum guards against a corrupted or swapped download; it comes from the same release,
