@@ -63,9 +63,9 @@ clashes with real flags, working shell completion). Decided in D1.
 | Command | What it does |
 |---|---|
 | `enishi up [--log-file [PATH]]` | Run the daemon (foreground). `--log-file` also writes a size-rotated log (default `enishi.log` in the config dir); the installed unit / task runs `up --log-file`. |
-| `enishi install [--prefix DIR] [--name N] [--no-start] [--firewall]` / `enishi uninstall [--name N] [--purge --yes]` | Per-user install: binary, autostart (systemd user unit / logon task), start; reverse it (§7). |
+| `enishi install [--prefix DIR] [--name N] [--no-start] [--no-firewall]` / `enishi uninstall [--name N] [--purge --yes] [--no-firewall]` | Per-user install: binary, autostart (systemd user unit / logon task), start; reverse it (§7). |
 | `enishi logs [-n N] [-f]` | Print / follow the daemon log file. |
-| `enishi firewall [--name N] [--remove]` | Windows: Private-only inbound rule for enishi (needs admin; prints the elevated command otherwise). |
+| `enishi firewall [--name N] [--remove \| --check]` | Windows: Private-only inbound rule for enishi (self-elevates: one UAC prompt; `--check` is read-only). |
 | `enishi id` | Print this device's public id. |
 | `enishi pair invite` / `enishi pair join <code>` | One-time pairing (see §6). |
 | `enishi reload` | Re-read `enishi.toml` into the running daemon (peers, grants, services). |
@@ -467,7 +467,8 @@ path, so it also picks up pending manual edits.
 ## 7. Platform specifics
 
 **Installing (v0.1 step 6).** No installer packages: the binary installs itself, per user,
-with no admin rights (only the optional Windows firewall rule needs elevation).
+with no admin rights; the firewall step asks for them once (Windows UAC / an offered
+`sudo` on Linux) and is skippable (`--no-firewall`).
 `enishi install` copies the *running* binary to the install dir, registers autostart,
 starts it and waits until the daemon answers over IPC. Re-running it (from a newer
 binary) is the upgrade path; it is idempotent. Each install writes a small record
@@ -514,13 +515,22 @@ stderr). `enishi logs [-n N] [-f]` prints/follows it across rotations.
   running image) and writes the new one; leftovers are cleaned on the next
   install/uninstall. Uninstall run from the installed `enishi.exe` deletes that file from
   a detached `cmd` after it exits.
-- **Firewall** (`install --firewall` or `enishi firewall`): one inbound **UDP** rule named
-  after the install, **Private profile only**, scoped to `enishiw.exe` and `enishi.exe`;
-  it first deletes every rule bound to those program paths (what the "allow access"
-  prompt creates: TCP+UDP, often Public too). Needs admin: when not elevated, install
-  prints the exact one-line `Start-Process -Verb RunAs …` command instead of failing, and
-  a default install prints it as a hint. Uninstall removes the rule (or prints the
-  elevated command).
+- **Firewall** (automatic in `install`, also `enishi firewall`): one inbound **UDP** rule
+  named after the install, **Private profile only**, scoped to `enishiw.exe` and
+  `enishi.exe`; it first deletes every rule bound to those program paths (what the "allow
+  access" prompt creates: allow *or* block, TCP+UDP, often Public too). Install reads the
+  rules unelevated (`Get-NetFirewallRule` + application/port filters) and decides: exactly
+  our two rules → nothing; anything else → fix. The fix runs **before the task starts** (so
+  the daemon never listens without a rule and Windows never shows its own prompt, which
+  leaves Block rules when ignored): unless already elevated, `ShellExecuteExW` with the
+  `runas` verb launches the *installed* `enishi.exe firewall --elevated …` hidden (one UAC
+  prompt) and waits for its exit code. Declined (`ERROR_CANCELLED`), failed or unanswered
+  within 60 s → install continues and prints one line: enishi works without the rule
+  (outbound-initiated link), add it later with `enishi firewall`. Upgrades only prompt when
+  the rules are not already right. `enishi firewall` self-elevates the same way;
+  `--check` only reports. Uninstall removes the rules with the same single prompt (skipped
+  when there are none; declined or `--no-firewall` → prints the elevated `netsh` line).
+  `install --firewall` is accepted as a hidden no-op for compatibility.
 - Default `exec` shell: PowerShell (pwsh if present, else Windows PowerShell 5.1).
 - Interactive `shell` uses ConPTY.
 
@@ -529,7 +539,17 @@ stderr). `enishi logs [-n N] [-f]` prints/follows it across rotations.
   --log-file`, `Restart=on-failure`, `WantedBy=default.target`, pinned config as
   `Environment=ENISHI_CONFIG=…`; `daemon-reload`, `enable`, `restart` (so an upgrade picks
   the new binary up; the binary itself is replaced by an atomic rename, safe while it
-  runs). Binary in `~/.local/bin/enishi` (or `--prefix`). Install checks
+  runs). Binary in `~/.local/bin/enishi` (or `--prefix`). Firewall: no per-app prompts on
+  Linux, but distros may block inbound UDP. Install detects an active firewalld
+  (`firewall-cmd --state`, falling back to the unit state since `--state` may need polkit)
+  or ufw (`ufw status verbose`; unreadable without root → "unknown") and checks the
+  daemon's `listen_port`/udp in the zone of the default route's interface (firewalld
+  `--query-port`, which matches ranges). Closed/unknown: with a terminal it asks
+  `Open UDP <port> in <tool>? [y/N]` and runs the exact sudo commands (firewalld runtime +
+  `--permanent`, no reload; `ufw allow <port>/udp`), sudo prompting for the password;
+  without one it prints them. Never sudo non-interactively. No `listen_port` → says the
+  link works outbound-only and suggests setting one. `install.sh` hands `/dev/tty` to
+  `install` when piped. Install checks
   `loginctl show-user $USER -p Linger` and, if off, prints the
   `sudo loginctl enable-linger <user>` hint for headless servers (never runs sudo).
 - Local IPC: Unix socket (0600) in `$XDG_RUNTIME_DIR/enishi.sock`, falling back to the
@@ -587,4 +607,4 @@ builds for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` + `SHA256SUMS
 | **D12** | Raw spawns (services, `exec --raw`, transparent MCP) resolve the program on Windows through `PATH` × `PATHEXT` (never the cwd) to a full path; `.cmd`/`.bat` are then launched by Rust std, which since 1.77 runs them via `cmd.exe /e:ON /v:OFF /d /c` with BatBadBut-safe quoting (and refuses args it cannot quote safely). |
 | **D13** | Transparent MCP (`enishi mcp -d dev -- cmd…`) needs its own grant `mcp = true` (`McpPolicy`, same enum as `ExecPolicy`, one `authorize_mcp`). `exec = true` does not imply it: `exec` is for humans/scripts with a shell, `mcp` is what an agent config may trigger unattended; keeping them apart lets a device allow one without the other (and later allowlist MCP packages only). Published services keep working with services grants alone. |
 | **D14** | TCP forwarding: `kind = "tcp"` services (`target`), one QUIC bi-stream per TCP connection on the warm stream connection, connect-before-ack, half-close preserved, fast fail while the peer is offline with the listener kept. Listeners live in the daemon (`enishi forward` holds one for its lifetime; `[forwards.*]` for the daemon's). |
-| **D15** | Packaging is the binary itself: `enishi install/uninstall` per user (systemd user unit / logon scheduled task + user PATH), no admin except the optional Private-only firewall rule; idempotent re-install = upgrade; an install record makes uninstall exact. Windows runs a GUI-subsystem copy (`enishiw.exe`) so the daemon never has a console window. The service logs to a 5 MiB-rotated file in the config dir (`enishi logs`). |
+| **D15** | Packaging is the binary itself: `enishi install/uninstall` per user (systemd user unit / logon scheduled task + user PATH), no admin except the Private-only firewall rule, which install sets automatically with one UAC prompt before the daemon first listens (decline → still works outbound; Linux: offered sudo for firewalld/ufw); idempotent re-install = upgrade; an install record makes uninstall exact. Windows runs a GUI-subsystem copy (`enishiw.exe`) so the daemon never has a console window. The service logs to a 5 MiB-rotated file in the config dir (`enishi logs`). |

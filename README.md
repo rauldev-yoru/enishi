@@ -65,16 +65,22 @@ What `install` does:
 - **Windows**: `enishi.exe` (CLI, added to your user `PATH`) and `enishiw.exe` (the same
   program built as a windowless app) in `%LOCALAPPDATA%\Programs\enishi`, and a logon
   scheduled task running `enishiw.exe up` in your session: starts when you log on, restarts on
-  failure, no time limit, no console window. The firewall rule is optional and the only step
-  that needs admin: `enishi install --firewall` (or `enishi firewall` later) adds one inbound rule
-  for enishi on **Private** networks only and removes the broader ones Windows creates on first
-  use; when not elevated it prints the one-line command to run it with a UAC prompt.
+  failure, no time limit, no console window. Before the daemon first listens, install asks for
+  admin rights **once** (one UAC prompt) to add a single inbound UDP rule for enishi on
+  **Private** networks only and remove the broader allow/block rules Windows creates on first
+  use — so Windows never shows its own "allow access" dialog. Upgrades only ask if the rules
+  changed. Say no and enishi still works (links are started outbound); add the rule later with
+  `enishi firewall` (`--check` reports, `--remove` undoes). `--no-firewall` skips the step.
+- **Linux firewall**: if firewalld or ufw is active and blocks the daemon's `listen_port`/udp,
+  install offers to run the exact `sudo firewall-cmd …` / `sudo ufw allow …` command (asks
+  first; without a terminal it only prints it). No fixed `listen_port` → outbound-only, which
+  still works.
 
 Re-running `enishi install` from a newer binary upgrades in place (stops the daemon, swaps the
 files, starts it again). `enishi uninstall` removes the service/task, the `PATH` entry and the
 binaries; `--purge --yes` also deletes the config, the device identity and the logs.
 Options: `--prefix DIR` (install dir), `--name NAME` (unit/task name, to run a second instance,
-e.g. with `--config`), `--no-start`. A non-default config (`--config` / `ENISHI_CONFIG`) given at
+e.g. with `--config`), `--no-start`, `--no-firewall`. A non-default config (`--config` / `ENISHI_CONFIG`) given at
 install time is pinned into the service.
 
 ## Quick start
